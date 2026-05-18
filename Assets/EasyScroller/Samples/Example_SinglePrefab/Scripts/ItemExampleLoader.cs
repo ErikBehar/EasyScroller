@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.UI;
+using EasyScroller;
 
 public class ItemExampleLoader : MonoBehaviour
 {
@@ -21,8 +22,8 @@ public class ItemExampleLoader : MonoBehaviour
     {
         GetInfo();
         info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
-
-        image_holder.sprite = data.sprite_list[info.OriginalIndex];
+        info.OnContentRefreshRequested.AddListener(RefreshContent);
+        RefreshContent();
 
         if (info.IsCentered)
         {
@@ -48,11 +49,32 @@ public class ItemExampleLoader : MonoBehaviour
         info.RequestRemoveSelf();
     }
 
+    private void OnDestroy()
+    {
+        if (info != null)
+        {
+            info.OnCenteredStateChanged.RemoveListener(OnCenterStateChanged);
+            info.OnContentRefreshRequested.RemoveListener(RefreshContent);
+        }
+    }
+
     private void GetInfo()
     {
         if (info == null)
         {
             info = transform.parent.GetComponent<ScrollerItemRuntimeInfo>();
         }
+    }
+
+    private void RefreshContent()
+    {
+        GetInfo();
+        if (image_holder == null || data == null || data.sprite_list == null || data.sprite_list.Count == 0)
+        {
+            return;
+        }
+
+        int index = Mathf.Clamp(info.OriginalIndex, 0, data.sprite_list.Count - 1);
+        image_holder.sprite = data.sprite_list[index];
     }
 }

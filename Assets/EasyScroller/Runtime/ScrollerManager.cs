@@ -2,14 +2,24 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 
-public enum ScrollerItemSourceMode
+namespace EasyScroller
 {
-    PrefabList,
-    SinglePrefabWithCount
-}
+    public enum ScrollerItemSourceMode
+    {
+        PrefabList,
+        SinglePrefabWithCount
+    }
 
-public class ScrollerManager : MonoBehaviour
-{
+    public enum ScrollerListMode
+    {
+        Infinite,
+        Finite
+    }
+
+    public class ScrollerManager : MonoBehaviour
+    {
+        private const int SharedSinglePrefabPoolKey = -1;
+
     [Header("Item Source")]
     [SerializeField, Tooltip("Initialization mode: use prefab_list, or duplicate one prefab for a fixed item count.")]
     private ScrollerItemSourceMode item_source_mode = ScrollerItemSourceMode.PrefabList;
@@ -23,6 +33,8 @@ public class ScrollerManager : MonoBehaviour
     [Header("Spacing + Visibility")]
     [SerializeField, Tooltip("Primary axis used for scrolling and layout.")]
     private ScrollerAxis scroll_axis = ScrollerAxis.Vertical;
+    [SerializeField, Tooltip("Infinite wraps forever. Finite stops when first/last item reaches the viewport border.")]
+    private ScrollerListMode list_mode = ScrollerListMode.Infinite;
     [SerializeField, Tooltip("Additional edge-to-edge gap between neighboring items on the primary axis.")]
     private float item_gap = 100f;
     [SerializeField, Tooltip("Extra offscreen items kept active before pooling to reduce pop-in.")]
@@ -82,10 +94,16 @@ public class ScrollerManager : MonoBehaviour
     [SerializeField, Tooltip("Hide items on initial build until layout and spacing have stabilized.")]
     private bool hide_items_until_initial_settle = true;
 
+    [Header("Scrollbar (Optional)")]
+    [SerializeField, Tooltip("Optional UGUI scrollbar used to control finite scroll position.")]
+    private Scrollbar linked_scrollbar;
+    [SerializeField, Tooltip("Invert normalized scrollbar direction. Useful when top should map to value=1.")]
+    private bool invert_scrollbar_value = false;
+
     private class ItemState
     {
         public readonly GameObject Prefab;
-        public readonly int SourcePrefabIndex;
+        public int SourcePrefabIndex;
         public readonly int OriginalItemIndex;
         public float Height;
         public bool Enabled = true;
@@ -142,8 +160,20 @@ public class ScrollerManager : MonoBehaviour
     private int _programmaticStepOrder;
     private bool _pendingInitialReveal;
     private int _currentCenterOrder;
+    private bool _suppressScrollbarCallback;
+    private Scrollbar _registeredScrollbar;
 
     public ScrollerAxis ScrollAxis => scroll_axis;
+
+    void OnEnable()
+    {
+        RebindLinkedScrollbarCallback();
+    }
+
+    void OnDisable()
+    {
+        UnregisterLinkedScrollbarCallback();
+    }
 
     void Start()
     {
@@ -164,6 +194,7 @@ public class ScrollerManager : MonoBehaviour
         BeginRelayoutSmoothing();
         _pendingInitialReveal = hide_items_until_initial_settle;
         SyncVisibleWindow();
+        RefreshLinkedScrollbarState();
     }
 
     public void SetPrefabs(IList<GameObject> prefabs)
@@ -180,18 +211,58 @@ public class ScrollerManager : MonoBehaviour
             }
         }
 
+        DestroyAllVisualsAndClearPools();
         BuildItemState();
-        RefreshEnabledIndices();
-        BeginRelayoutSmoothing();
         _pendingInitialReveal = hide_items_until_initial_settle;
+        ApplyStructureChangeAndRefreshVisuals();
+    }
+
+    // Wire this to UGUI Scrollbar.OnValueChanged(float).
+    public void OnScrollbarValueChanged(float normalizedValue)
+    {
+        if (_suppressScrollbarCallback)
+        {
+            return;
+        }
+
+        if (_enabledIndices.Count == 0)
+        {
+            return;
+        }
+
+        if (!IsFiniteMode())
+        {
+            // Standard 0..1 scrollbar semantics only apply to bounded finite mode.
+            return;
+        }
+
+        float effectiveValue = Mathf.Clamp01(normalizedValue);
+        if (invert_scrollbar_value)
+        {
+            effectiveValue = 1f - effectiveValue;
+        }
+
+        GetFiniteOffsetBounds(out float minOffset, out float maxOffset);
+        float targetOffset = Mathf.Lerp(minOffset, maxOffset, effectiveValue);
+
+        _scrollOffset = ClampOffsetForMode(targetOffset);
+        _scrollVelocity = 0f;
+        _snapVelocity = 0f;
+        _hasSnapTarget = false;
+        _snapTargetLockedUntilUserInput = false;
+        _hasProgrammaticStepAnchor = false;
         SyncVisibleWindow();
+        RefreshLinkedScrollbarState();
     }
 
     void Update()
     {
+        RebindLinkedScrollbarCallback();
+
         if (_enabledIndices.Count == 0)
         {
             DeactivateAllActiveVisuals();
+            RefreshLinkedScrollbarState();
             return;
         }
 
@@ -201,6 +272,12 @@ public class ScrollerManager : MonoBehaviour
         if (!_isDragging && hasVelocity)
         {
             _scrollOffset += _scrollVelocity * dt;
+            float clampedOffset = ClampOffsetForMode(_scrollOffset);
+            if (!Mathf.Approximately(clampedOffset, _scrollOffset))
+            {
+                _scrollOffset = clampedOffset;
+                _scrollVelocity = 0f;
+            }
             _scrollVelocity = Mathf.Lerp(_scrollVelocity, 0f, inertia_damping * dt);
         }
 
@@ -211,7 +288,7 @@ public class ScrollerManager : MonoBehaviour
                 int candidateOrder;
                 if (_snapTargetLockedUntilUserInput)
                 {
-                    candidateOrder = _snapTargetOrder;
+                    candidateOrder = ClampOrderForMode(_snapTargetOrder);
                 }
                 else
                 {
@@ -233,6 +310,7 @@ public class ScrollerManager : MonoBehaviour
             }
 
             _scrollOffset = Mathf.SmoothDamp(_scrollOffset, _snapTargetOffset, ref _snapVelocity, snap_smooth_time, snap_max_speed, dt);
+            _scrollOffset = ClampOffsetForMode(_scrollOffset);
 
             // Prevent inertia from fighting snap while in settle mode.
             _scrollVelocity = 0f;
@@ -275,6 +353,8 @@ public class ScrollerManager : MonoBehaviour
             _pendingInitialReveal = false;
             BroadcastCenteredStateForCurrentOrder();
         }
+
+        RefreshLinkedScrollbarState();
     }
 
     public void SetItemEnabled(int itemIndex, bool enabled)
@@ -290,17 +370,7 @@ public class ScrollerManager : MonoBehaviour
         }
 
         _items[itemIndex].Enabled = enabled;
-        RefreshEnabledIndices();
-        BeginRelayoutSmoothing();
-
-        if (_enabledIndices.Count == 0)
-        {
-            DeactivateAllActiveVisuals();
-            _centeredLogicalIndex = -1;
-            return;
-        }
-
-        SyncVisibleWindow();
+        ApplyStructureChangeAndRefreshVisuals();
     }
 
     public int GetCenteredLogicalIndex()
@@ -320,6 +390,66 @@ public class ScrollerManager : MonoBehaviour
         AddItemAtRuntime(prefab);
     }
 
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void InsertItemNoRet(int itemIndex)
+    {
+        InsertItemAtRuntime(itemIndex);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void InsertItemWithPrefabNoRet(int itemIndex, GameObject prefab)
+    {
+        InsertItemAtRuntime(itemIndex, prefab);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void RemoveItemPermanentlyNoRet(int itemIndex)
+    {
+        RemoveItemPermanentlyAtRuntime(itemIndex);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void ReorderItemNoRet(int fromIndex, int toIndex)
+    {
+        ReorderItemAtRuntime(fromIndex, toIndex);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void ScrollToLogicalIndexNoRet(int logicalIndex)
+    {
+        ScrollToLogicalIndex(logicalIndex);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void JumpToLogicalIndexNoRet(int logicalIndex)
+    {
+        ScrollToLogicalIndex(logicalIndex, false);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void ScrollToOriginalIndexNoRet(int originalIndex)
+    {
+        ScrollToOriginalIndex(originalIndex);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void JumpToOriginalIndexNoRet(int originalIndex)
+    {
+        ScrollToOriginalIndex(originalIndex, false);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void ScrollToRuntimeInfoNoRet(ScrollerItemRuntimeInfo runtimeInfo)
+    {
+        ScrollToRuntimeInfo(runtimeInfo);
+    }
+
+    // Kept as void wrappers so they can be easily wired to Unity Events/UI Buttons.
+    public void JumpToRuntimeInfoNoRet(ScrollerItemRuntimeInfo runtimeInfo)
+    {
+        ScrollToRuntimeInfo(runtimeInfo, false);
+    }
+
     public bool AddItemAtRuntime(GameObject prefab)
     {
         if (item_source_mode == ScrollerItemSourceMode.SinglePrefabWithCount)
@@ -336,9 +466,7 @@ public class ScrollerManager : MonoBehaviour
         int sourcePrefabIndex = prefab_list.Count;
         prefab_list.Add(prefab);
         _items.Add(new ItemState(prefab, ResolvePrefabPrimarySize(prefab), sourcePrefabIndex, sourcePrefabIndex));
-        RefreshEnabledIndices();
-        BeginRelayoutSmoothing();
-        SyncVisibleWindow();
+        ApplyStructureChangeAndRefreshVisuals();
         return true;
     }
 
@@ -358,10 +486,7 @@ public class ScrollerManager : MonoBehaviour
 
         int nextOriginalIndex = GetNextOriginalItemIndex();
         _items.Add(new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextOriginalIndex));
-        single_prefab_count = Mathf.Max(0, single_prefab_count) + 1;
-        RefreshEnabledIndices();
-        BeginRelayoutSmoothing();
-        SyncVisibleWindow();
+        ApplyStructureChangeAndRefreshVisuals();
         return true;
     }
 
@@ -379,22 +504,18 @@ public class ScrollerManager : MonoBehaviour
 
         _items[itemIndex].Enabled = false;
         PurgeVisualsForLogicalIndex(itemIndex);
-        RefreshEnabledIndices();
-        BeginRelayoutSmoothing();
-
-        if (_enabledIndices.Count == 0)
-        {
-            DeactivateAllActiveVisuals();
-            _centeredLogicalIndex = -1;
-            return true;
-        }
-
-        SyncVisibleWindow();
+        ApplyStructureChangeAndRefreshVisuals();
         return true;
     }
 
     public bool RemoveItemByPrefabListIndex(int prefabListIndex)
     {
+        if (item_source_mode != ScrollerItemSourceMode.PrefabList)
+        {
+            Debug.LogWarning("RemoveItemByPrefabListIndex(...) is only valid in PrefabList mode.");
+            return false;
+        }
+
         int runtimeIndex = -1;
         for (int i = 0; i < _items.Count; i++)
         {
@@ -423,6 +544,149 @@ public class ScrollerManager : MonoBehaviour
         return RemoveItemAtRuntime(runtimeInfo.LogicalIndex);
     }
 
+    public bool InsertItemAtRuntime(int itemIndex, GameObject prefab)
+    {
+        if (item_source_mode == ScrollerItemSourceMode.SinglePrefabWithCount)
+        {
+            return InsertItemAtRuntime(itemIndex);
+        }
+
+        if (prefab == null)
+        {
+            Debug.LogWarning("InsertItemAtRuntime(itemIndex, prefab) requires a non-null prefab in PrefabList mode.");
+            return false;
+        }
+
+        int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
+        int nextOriginalIndex = GetNextOriginalItemIndex();
+        ItemState newItem = new ItemState(prefab, ResolvePrefabPrimarySize(prefab), clampedIndex, nextOriginalIndex);
+        _items.Insert(clampedIndex, newItem);
+        prefab_list.Insert(clampedIndex, prefab);
+        ReindexSourcePrefabIndices();
+        DestroyAllVisualsAndClearPools();
+        ApplyStructureChangeAndRefreshVisuals();
+        return true;
+    }
+
+    public bool InsertItemAtRuntime(int itemIndex)
+    {
+        if (item_source_mode == ScrollerItemSourceMode.PrefabList)
+        {
+            Debug.LogWarning("InsertItemAtRuntime(itemIndex) requires a prefab argument in PrefabList mode.");
+            return false;
+        }
+
+        if (single_prefab == null)
+        {
+            Debug.LogWarning("single_prefab is null; cannot insert item in SinglePrefabWithCount mode.");
+            return false;
+        }
+
+        int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
+        int nextOriginalIndex = GetNextOriginalItemIndex();
+        ItemState newItem = new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextOriginalIndex);
+        _items.Insert(clampedIndex, newItem);
+        DestroyAllVisualsAndClearPools();
+        ApplyStructureChangeAndRefreshVisuals();
+        return true;
+    }
+
+    public bool RemoveItemPermanentlyAtRuntime(int itemIndex)
+    {
+        if (itemIndex < 0 || itemIndex >= _items.Count)
+        {
+            return false;
+        }
+
+        ItemState removedItem = _items[itemIndex];
+        _items.RemoveAt(itemIndex);
+
+        if (item_source_mode == ScrollerItemSourceMode.PrefabList)
+        {
+            int sourceIndex = removedItem.SourcePrefabIndex;
+            if (sourceIndex >= 0 && sourceIndex < prefab_list.Count)
+            {
+                prefab_list.RemoveAt(sourceIndex);
+            }
+            ReindexSourcePrefabIndices();
+        }
+
+        DestroyAllVisualsAndClearPools();
+        ApplyStructureChangeAndRefreshVisuals();
+        return true;
+    }
+
+    public bool ReorderItemAtRuntime(int fromIndex, int toIndex)
+    {
+        if (fromIndex < 0 || fromIndex >= _items.Count || toIndex < 0 || toIndex >= _items.Count)
+        {
+            return false;
+        }
+
+        if (fromIndex == toIndex)
+        {
+            return true;
+        }
+
+        ItemState movedItem = _items[fromIndex];
+        _items.RemoveAt(fromIndex);
+        _items.Insert(toIndex, movedItem);
+
+        if (item_source_mode == ScrollerItemSourceMode.PrefabList)
+        {
+            GameObject movedPrefab = prefab_list[fromIndex];
+            prefab_list.RemoveAt(fromIndex);
+            prefab_list.Insert(toIndex, movedPrefab);
+            ReindexSourcePrefabIndices();
+        }
+
+        DestroyAllVisualsAndClearPools();
+        ApplyStructureChangeAndRefreshVisuals();
+        return true;
+    }
+
+    public bool ScrollToLogicalIndex(int logicalIndex, bool animated = true)
+    {
+        if (logicalIndex < 0 || logicalIndex >= _items.Count || !_items[logicalIndex].Enabled)
+        {
+            return false;
+        }
+
+        int targetOrder = GetTargetOrderForLogicalIndex(logicalIndex);
+        float targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
+        return ScrollToOffsetAndOrder(targetOffset, targetOrder, animated);
+    }
+
+    public bool ScrollToOriginalIndex(int originalIndex, bool animated = true)
+    {
+        int logicalIndex = -1;
+        for (int i = 0; i < _items.Count; i++)
+        {
+            if (_items[i].OriginalItemIndex == originalIndex && _items[i].Enabled)
+            {
+                logicalIndex = i;
+                break;
+            }
+        }
+
+        if (logicalIndex < 0)
+        {
+            return false;
+        }
+
+        return ScrollToLogicalIndex(logicalIndex, animated);
+    }
+
+    public bool ScrollToRuntimeInfo(ScrollerItemRuntimeInfo runtimeInfo, bool animated = true)
+    {
+        if (runtimeInfo == null)
+        {
+            return false;
+        }
+
+        return ScrollToLogicalIndex(runtimeInfo.LogicalIndex, animated);
+    }
+
     public bool MoveScrollerByDirection(int direction, int steps = 1)
     {
         if (_enabledIndices.Count == 0 || direction == 0 || steps <= 0)
@@ -431,33 +695,12 @@ public class ScrollerManager : MonoBehaviour
         }
 
         int sign = direction > 0 ? 1 : -1;
-        int baseOrder;
-        bool userDrivenMotion = _isDragging || Mathf.Abs(_scrollVelocity) > 0.001f;
-        if (userDrivenMotion)
-        {
-            // Re-anchor to what is currently closest when motion comes from drag/inertia.
-            baseOrder = GetNearestOrderToOffset(_scrollOffset);
-            _hasProgrammaticStepAnchor = false;
-        }
-        else if (_hasProgrammaticStepAnchor)
-        {
-            baseOrder = _programmaticStepOrder;
-        }
-        else if (_hasSnapTarget)
-        {
-            baseOrder = _snapTargetOrder;
-        }
-        else if (_hasSettledOrder)
-        {
-            baseOrder = _settledOrder;
-        }
-        else
-        {
-            baseOrder = GetNearestOrderToOffset(_scrollOffset);
-        }
+        int baseOrder = GetReferenceOrderForProgrammaticNavigation();
 
         int targetOrder = baseOrder + (sign * steps);
+        targetOrder = ClampOrderForMode(targetOrder);
         float targetOffset = GetOrderCenterPosition(targetOrder);
+        targetOffset = ClampOffsetForMode(targetOffset);
         _programmaticStepOrder = targetOrder;
         _hasProgrammaticStepAnchor = true;
 
@@ -557,6 +800,104 @@ public class ScrollerManager : MonoBehaviour
         return next;
     }
 
+    private int GetTargetOrderForLogicalIndex(int logicalIndex)
+    {
+        int orderInEnabled = _enabledIndices.IndexOf(logicalIndex);
+        if (orderInEnabled < 0)
+        {
+            return 0;
+        }
+
+        if (IsFiniteMode())
+        {
+            return orderInEnabled;
+        }
+
+        int count = _enabledIndices.Count;
+        int referenceOrder = GetReferenceOrderForProgrammaticNavigation();
+        int cycle = FloorDiv(referenceOrder, count);
+        int candidate = (cycle * count) + orderInEnabled;
+        int candidatePlus = candidate + count;
+        int candidateMinus = candidate - count;
+        float referenceOffset = _scrollOffset;
+        float bestDistance = Mathf.Abs(GetOrderCenterPosition(candidate) - referenceOffset);
+        int bestOrder = candidate;
+        float plusDistance = Mathf.Abs(GetOrderCenterPosition(candidatePlus) - referenceOffset);
+        if (plusDistance < bestDistance)
+        {
+            bestDistance = plusDistance;
+            bestOrder = candidatePlus;
+        }
+        float minusDistance = Mathf.Abs(GetOrderCenterPosition(candidateMinus) - referenceOffset);
+        if (minusDistance < bestDistance)
+        {
+            bestOrder = candidateMinus;
+        }
+
+        return bestOrder;
+    }
+
+    private int GetReferenceOrderForProgrammaticNavigation()
+    {
+        bool userDrivenMotion = _isDragging || Mathf.Abs(_scrollVelocity) > 0.001f;
+        if (userDrivenMotion)
+        {
+            _hasProgrammaticStepAnchor = false;
+            return GetNearestOrderToOffset(_scrollOffset);
+        }
+
+        if (_hasProgrammaticStepAnchor)
+        {
+            return _programmaticStepOrder;
+        }
+
+        if (_hasSnapTarget)
+        {
+            return _snapTargetOrder;
+        }
+
+        if (_hasSettledOrder)
+        {
+            return _settledOrder;
+        }
+
+        return GetNearestOrderToOffset(_scrollOffset);
+    }
+
+    private bool ScrollToOffsetAndOrder(float targetOffset, int targetOrder, bool animated)
+    {
+        if (_enabledIndices.Count == 0)
+        {
+            return false;
+        }
+
+        _isDragging = false;
+        _scrollVelocity = 0f;
+        _snapVelocity = 0f;
+        _hasProgrammaticStepAnchor = true;
+        _programmaticStepOrder = ClampOrderForMode(targetOrder);
+
+        if (animated && enable_snapping)
+        {
+            _snapTargetOrder = _programmaticStepOrder;
+            _snapTargetOffset = targetOffset;
+            _hasSnapTarget = true;
+            _snapTargetLockedUntilUserInput = true;
+        }
+        else
+        {
+            _scrollOffset = targetOffset;
+            _hasSnapTarget = false;
+            _snapTargetLockedUntilUserInput = false;
+            _hasSettledOrder = true;
+            _settledOrder = _programmaticStepOrder;
+        }
+
+        SyncVisibleWindow();
+        RefreshLinkedScrollbarState();
+        return true;
+    }
+
     private void RefreshEnabledIndices()
     {
         _enabledIndices.Clear();
@@ -569,6 +910,19 @@ public class ScrollerManager : MonoBehaviour
         }
 
         RebuildEnabledSpacingData();
+    }
+
+    private void ReindexSourcePrefabIndices()
+    {
+        if (item_source_mode != ScrollerItemSourceMode.PrefabList)
+        {
+            return;
+        }
+
+        for (int i = 0; i < _items.Count; i++)
+        {
+            _items[i].SourcePrefabIndex = i;
+        }
     }
 
     private float ResolvePrefabPrimarySize(GameObject prefab)
@@ -598,10 +952,10 @@ public class ScrollerManager : MonoBehaviour
         }
 
         RectTransform prefabRect = prefab.GetComponent<RectTransform>();
-        float sizeDeltaPrimary = ScrollerAxisAdapter.GetSizeDeltaPrimary(prefabRect, scroll_axis);
-        if (sizeDeltaPrimary > 0.01f)
+        float sizeDeltaAxis = ScrollerAxisAdapter.GetSizeDeltaPrimary(prefabRect, scroll_axis);
+        if (sizeDeltaAxis > 0.01f)
         {
-            return sizeDeltaPrimary;
+            return sizeDeltaAxis;
         }
 
         return 100f;
@@ -742,7 +1096,14 @@ public class ScrollerManager : MonoBehaviour
                 visual != null &&
                 visual.RectTransform != null)
             {
-                Destroy(visual.RectTransform.gameObject);
+                if (IsSharedVisualRecycleMode())
+                {
+                    ReleaseVisual(visual);
+                }
+                else
+                {
+                    Destroy(visual.RectTransform.gameObject);
+                }
             }
             _activeVisualsByOrder.Remove(order);
             _measuredOrderSizes.Remove(order);
@@ -765,6 +1126,77 @@ public class ScrollerManager : MonoBehaviour
     private void BeginRelayoutSmoothing()
     {
         _relayoutSmoothingActive = smooth_relayout_on_structure_change;
+    }
+
+    private void ApplyStructureChangeAndRefreshVisuals()
+    {
+        RefreshEnabledIndices();
+        SyncSinglePrefabCountFromEnabledItems();
+        NormalizeMotionStateAfterStructureChange();
+        BeginRelayoutSmoothing();
+
+        if (_enabledIndices.Count == 0)
+        {
+            DeactivateAllActiveVisuals();
+            _centeredLogicalIndex = -1;
+            RefreshLinkedScrollbarState();
+            return;
+        }
+
+        SyncVisibleWindow();
+        RefreshLinkedScrollbarState();
+    }
+
+    private void SyncSinglePrefabCountFromEnabledItems()
+    {
+        if (item_source_mode != ScrollerItemSourceMode.SinglePrefabWithCount)
+        {
+            return;
+        }
+
+        int enabledCount = 0;
+        for (int i = 0; i < _items.Count; i++)
+        {
+            if (_items[i].Enabled)
+            {
+                enabledCount++;
+            }
+        }
+
+        single_prefab_count = enabledCount;
+    }
+
+    private void NormalizeMotionStateAfterStructureChange()
+    {
+        if (_enabledIndices.Count == 0)
+        {
+            _scrollOffset = 0f;
+            _scrollVelocity = 0f;
+            _snapVelocity = 0f;
+            _hasSnapTarget = false;
+            _hasSettledOrder = false;
+            _hasProgrammaticStepAnchor = false;
+            _snapTargetLockedUntilUserInput = false;
+            return;
+        }
+
+        _scrollOffset = ClampOffsetForMode(_scrollOffset);
+
+        if (_hasSnapTarget)
+        {
+            _snapTargetOrder = ClampOrderForMode(_snapTargetOrder);
+            _snapTargetOffset = GetOrderCenterPosition(_snapTargetOrder);
+        }
+
+        if (_hasSettledOrder)
+        {
+            _settledOrder = ClampOrderForMode(_settledOrder);
+        }
+
+        if (_hasProgrammaticStepAnchor)
+        {
+            _programmaticStepOrder = ClampOrderForMode(_programmaticStepOrder);
+        }
     }
 
     private void SetVisibilityForVisibleVisuals(bool isVisible)
@@ -811,8 +1243,11 @@ public class ScrollerManager : MonoBehaviour
 
     public void ApplyUserDragDelta(float deltaUnits, float deltaTime)
     {
+        float previousOffset = _scrollOffset;
         _scrollOffset += deltaUnits;
-        _scrollVelocity = deltaTime > 0f ? (deltaUnits / deltaTime) : 0f;
+        _scrollOffset = ClampOffsetForMode(_scrollOffset);
+        float realizedDelta = _scrollOffset - previousOffset;
+        _scrollVelocity = deltaTime > 0f ? (realizedDelta / deltaTime) : 0f;
     }
 
     public void EndUserDrag()
@@ -832,7 +1267,14 @@ public class ScrollerManager : MonoBehaviour
         {
             float singleSpan = (_items[_enabledIndices[0]].Height + item_gap);
             singleSpan = Mathf.Max(1f, singleSpan);
-            return absoluteOrder * singleSpan;
+            int safeOrder = IsFiniteMode() ? Mathf.Clamp(absoluteOrder, 0, 0) : absoluteOrder;
+            return safeOrder * singleSpan;
+        }
+
+        if (IsFiniteMode())
+        {
+            int finiteOrder = Mathf.Clamp(absoluteOrder, 0, count - 1);
+            return _enabledPrefixPositions[finiteOrder];
         }
 
         int cycleIndex = FloorDiv(absoluteOrder, count);
@@ -851,8 +1293,31 @@ public class ScrollerManager : MonoBehaviour
 
         if (count == 1)
         {
+            if (IsFiniteMode())
+            {
+                return 0;
+            }
+
             float singleSpan = Mathf.Max(1f, _items[_enabledIndices[0]].Height + item_gap);
             return Mathf.RoundToInt(offset / singleSpan);
+        }
+
+        if (IsFiniteMode())
+        {
+            float finiteBestDistance = float.MaxValue;
+            int finiteBestOrder = 0;
+            for (int order = 0; order < count; order++)
+            {
+                float orderPos = GetOrderCenterPosition(order);
+                float distance = Mathf.Abs(orderPos - offset);
+                if (distance < finiteBestDistance)
+                {
+                    finiteBestDistance = distance;
+                    finiteBestOrder = order;
+                }
+            }
+
+            return finiteBestOrder;
         }
 
         float bestDistance = float.MaxValue;
@@ -931,14 +1396,18 @@ public class ScrollerManager : MonoBehaviour
         int centerOrder,
         float centerPosition,
         int direction,
-        float minY,
-        float maxY)
+        float minAxis,
+        float maxAxis)
     {
         int stepLimit = Mathf.Max(4, _enabledIndices.Count + (buffer_item_count * 4));
         float cursorCenterPos = centerPosition;
         for (int i = 1; i <= stepLimit; i++)
         {
             int candidate = centerOrder + (i * direction);
+            if (IsFiniteMode() && (candidate < 0 || candidate >= _enabledIndices.Count))
+            {
+                break;
+            }
             if (direction > 0)
             {
                 cursorCenterPos += GetSpanToNextOrder(candidate - 1);
@@ -948,18 +1417,18 @@ public class ScrollerManager : MonoBehaviour
                 cursorCenterPos -= GetSpanToNextOrder(candidate);
             }
 
-            float y = cursorCenterPos - _scrollOffset;
+            float visualAxis = cursorCenterPos - _scrollOffset;
 
-            if (y < minY || y > maxY)
+            if (visualAxis < minAxis || visualAxis > maxAxis)
             {
                 float edgePad = _enabledAverageSpan * 1.2f;
-                if (y < (minY - edgePad) || y > (maxY + edgePad))
+                if (visualAxis < (minAxis - edgePad) || visualAxis > (maxAxis + edgePad))
                 {
                     break;
                 }
             }
 
-            if (y >= minY && y <= maxY)
+            if (visualAxis >= minAxis && visualAxis <= maxAxis)
             {
                 orders.Add(candidate);
                 orderCenters[candidate] = cursorCenterPos;
@@ -977,29 +1446,31 @@ public class ScrollerManager : MonoBehaviour
 
         float visibleHalfHeight = GetVisibleHalfExtent();
         float windowPadding = buffer_item_count * _enabledAverageSpan;
-        float minY = -visibleHalfHeight - windowPadding;
-        float maxY = visibleHalfHeight + windowPadding;
+        float minAxis = -visibleHalfHeight - windowPadding;
+        float maxAxis = visibleHalfHeight + windowPadding;
 
-        int centerOrder = _hasSnapTarget ? _snapTargetOrder : GetNearestOrderToOffset(_scrollOffset);
+        _scrollOffset = ClampOffsetForMode(_scrollOffset);
+
+        int centerOrder = _hasSnapTarget ? ClampOrderForMode(_snapTargetOrder) : GetNearestOrderToOffset(_scrollOffset);
         if (enable_snapping && !_hasSnapTarget && !_isDragging && Mathf.Abs(_scrollVelocity) < snap_velocity_threshold && _hasSettledOrder)
         {
-            centerOrder = _settledOrder;
+            centerOrder = ClampOrderForMode(_settledOrder);
         }
         _currentCenterOrder = centerOrder;
         _centeredLogicalIndex = ResolveLogicalIndexFromOrder(centerOrder);
         float centerPosition = GetOrderCenterPosition(centerOrder);
-        float centerY = centerPosition - _scrollOffset;
+        float centerAxis = centerPosition - _scrollOffset;
         _desiredOrders.Clear();
         _desiredOrderSet.Clear();
         _desiredOrderCenterPositions.Clear();
-        if (centerY >= minY && centerY <= maxY)
+        if (centerAxis >= minAxis && centerAxis <= maxAxis)
         {
             _desiredOrders.Add(centerOrder);
             _desiredOrderSet.Add(centerOrder);
             _desiredOrderCenterPositions[centerOrder] = centerPosition;
         }
-        AddVisibleOrderRange(_desiredOrders, _desiredOrderCenterPositions, centerOrder, centerPosition, 1, minY, maxY);
-        AddVisibleOrderRange(_desiredOrders, _desiredOrderCenterPositions, centerOrder, centerPosition, -1, minY, maxY);
+        AddVisibleOrderRange(_desiredOrders, _desiredOrderCenterPositions, centerOrder, centerPosition, 1, minAxis, maxAxis);
+        AddVisibleOrderRange(_desiredOrders, _desiredOrderCenterPositions, centerOrder, centerPosition, -1, minAxis, maxAxis);
 
         for (int i = 0; i < _desiredOrders.Count; i++)
         {
@@ -1067,6 +1538,16 @@ public class ScrollerManager : MonoBehaviour
             return -1;
         }
 
+        if (IsFiniteMode())
+        {
+            if (absoluteOrder < 0 || absoluteOrder >= _enabledIndices.Count)
+            {
+                return -1;
+            }
+
+            return _enabledIndices[absoluteOrder];
+        }
+
         int wrapped = Mod(absoluteOrder, _enabledIndices.Count);
         return _enabledIndices[wrapped];
     }
@@ -1079,12 +1560,7 @@ public class ScrollerManager : MonoBehaviour
             if (visual.LogicalIndex == logicalIndex)
             {
                 visual.AbsoluteOrderIndex = absoluteOrder;
-                if (visual.RuntimeInfo != null)
-                {
-                    visual.RuntimeInfo.SetLogicalIndex(logicalIndex);
-                    visual.RuntimeInfo.SetOriginalIndex(_items[logicalIndex].OriginalItemIndex);
-                    visual.RuntimeInfo.SetManager(this);
-                }
+                ApplyRuntimeInfoBinding(visual, logicalIndex);
                 return visual;
             }
 
@@ -1101,12 +1577,7 @@ public class ScrollerManager : MonoBehaviour
         visual.AbsoluteOrderIndex = absoluteOrder;
         visual.LogicalIndex = logicalIndex;
         visual.SnapToTargetOnPrepare = isNewOrderVisual;
-        if (visual.RuntimeInfo != null)
-        {
-            visual.RuntimeInfo.SetLogicalIndex(logicalIndex);
-            visual.RuntimeInfo.SetOriginalIndex(_items[logicalIndex].OriginalItemIndex);
-            visual.RuntimeInfo.SetManager(this);
-        }
+        ApplyRuntimeInfoBinding(visual, logicalIndex);
         if (!_desiredOrderCenterPositions.TryGetValue(absoluteOrder, out float targetCenterPosition))
         {
             targetCenterPosition = GetOrderCenterPosition(absoluteOrder);
@@ -1118,10 +1589,11 @@ public class ScrollerManager : MonoBehaviour
 
     private VisualItem AcquireVisual(int logicalIndex)
     {
-        if (!_pooledVisualsByLogicalIndex.TryGetValue(logicalIndex, out Stack<VisualItem> pool))
+        int poolKey = GetVisualPoolKey(logicalIndex);
+        if (!_pooledVisualsByLogicalIndex.TryGetValue(poolKey, out Stack<VisualItem> pool))
         {
             pool = new Stack<VisualItem>();
-            _pooledVisualsByLogicalIndex[logicalIndex] = pool;
+            _pooledVisualsByLogicalIndex[poolKey] = pool;
         }
 
         while (pool.Count > 0)
@@ -1177,19 +1649,19 @@ public class ScrollerManager : MonoBehaviour
             return;
         }
 
-        float targetPrimary = targetCenterPosition - _scrollOffset;
+        float targetAxis = targetCenterPosition - _scrollOffset;
         Vector2 anchored = visual.RectTransform.anchoredPosition;
         bool allowPrepareSnap = visual.SnapToTargetOnPrepare && !_pendingInitialReveal;
         if (allowPrepareSnap || !_relayoutSmoothingActive)
         {
-            visual.RectTransform.anchoredPosition = ScrollerAxisAdapter.WithPrimary(anchored, targetPrimary, scroll_axis);
+            visual.RectTransform.anchoredPosition = ScrollerAxisAdapter.WithPrimary(anchored, targetAxis, scroll_axis);
         }
         visual.SnapToTargetOnPrepare = false;
 
         float targetScale = 1f;
         if (enable_distance_scaling)
         {
-            float t = Mathf.InverseLerp(GetVisibleHalfExtent(), 0f, Mathf.Abs(targetPrimary));
+            float t = Mathf.InverseLerp(GetVisibleHalfExtent(), 0f, Mathf.Abs(targetAxis));
             targetScale = Mathf.Lerp(edge_scale, center_scale, t);
         }
         if (enable_center_highlight_scaling && isCenteredOrder)
@@ -1220,38 +1692,61 @@ public class ScrollerManager : MonoBehaviour
             visual.RuntimeInfo.SetCentered(false);
         }
 
-        if (!_pooledVisualsByLogicalIndex.TryGetValue(visual.LogicalIndex, out Stack<VisualItem> pool))
+        int poolKey = GetVisualPoolKey(visual.LogicalIndex);
+        if (!_pooledVisualsByLogicalIndex.TryGetValue(poolKey, out Stack<VisualItem> pool))
         {
             pool = new Stack<VisualItem>();
-            _pooledVisualsByLogicalIndex[visual.LogicalIndex] = pool;
+            _pooledVisualsByLogicalIndex[poolKey] = pool;
         }
 
         visual.RectTransform.gameObject.SetActive(false);
         pool.Push(visual);
     }
 
+    private bool ApplyRuntimeInfoBinding(VisualItem visual, int logicalIndex)
+    {
+        if (visual == null || visual.RuntimeInfo == null || logicalIndex < 0 || logicalIndex >= _items.Count)
+        {
+            return false;
+        }
+
+        int originalIndex = _items[logicalIndex].OriginalItemIndex;
+        bool bindingChanged = visual.RuntimeInfo.LogicalIndex != logicalIndex ||
+                              visual.RuntimeInfo.OriginalIndex != originalIndex;
+
+        visual.RuntimeInfo.SetLogicalIndex(logicalIndex);
+        visual.RuntimeInfo.SetOriginalIndex(originalIndex);
+        visual.RuntimeInfo.SetManager(this);
+        if (bindingChanged)
+        {
+            visual.RuntimeInfo.NotifyContentRefreshRequested();
+        }
+
+        return bindingChanged;
+    }
+
     private bool UpdateVisual(VisualItem visual, float targetCenterPosition, bool isCenteredOrder)
     {
-        float targetPrimary = targetCenterPosition - _scrollOffset;
+        float targetAxis = targetCenterPosition - _scrollOffset;
         Vector2 anchored = visual.RectTransform.anchoredPosition;
-        float currentPrimary = ScrollerAxisAdapter.GetPrimary(anchored, scroll_axis);
-        float y;
+        float currentAxis = ScrollerAxisAdapter.GetPrimary(anchored, scroll_axis);
+        float resolvedAxis;
         if (_relayoutSmoothingActive)
         {
             float lerpT = 1f - Mathf.Exp(-Mathf.Max(0.01f, relayout_lerp_speed) * Time.deltaTime);
-            y = Mathf.Lerp(currentPrimary, targetPrimary, lerpT);
+            resolvedAxis = Mathf.Lerp(currentAxis, targetAxis, lerpT);
         }
         else
         {
             // Keep spacing math authoritative during normal updates.
-            y = targetPrimary;
+            resolvedAxis = targetAxis;
         }
-        visual.RectTransform.anchoredPosition = ScrollerAxisAdapter.WithPrimary(anchored, y, scroll_axis);
+        visual.RectTransform.anchoredPosition = ScrollerAxisAdapter.WithPrimary(anchored, resolvedAxis, scroll_axis);
 
         float targetScale = 1f;
         if (enable_distance_scaling)
         {
-            float t = Mathf.InverseLerp(GetVisibleHalfExtent(), 0f, Mathf.Abs(y));
+            float t = Mathf.InverseLerp(GetVisibleHalfExtent(), 0f, Mathf.Abs(resolvedAxis));
             targetScale = Mathf.Lerp(edge_scale, center_scale, t);
         }
         if (enable_center_highlight_scaling && isCenteredOrder)
@@ -1261,7 +1756,7 @@ public class ScrollerManager : MonoBehaviour
         Vector3 desiredScale = visual.BaseLocalScale * targetScale;
         visual.RectTransform.localScale = Vector3.Lerp(visual.RectTransform.localScale, desiredScale, scale_lerp_speed * Time.deltaTime);
 
-        return Mathf.Abs(y - targetPrimary) <= relayout_settle_epsilon;
+        return Mathf.Abs(resolvedAxis - targetAxis) <= relayout_settle_epsilon;
     }
 
     private void DeactivateAllActiveVisuals()
@@ -1283,6 +1778,173 @@ public class ScrollerManager : MonoBehaviour
         }
     }
 
+    private void DestroyAllVisualsAndClearPools()
+    {
+        foreach (KeyValuePair<int, VisualItem> kvp in _activeVisualsByOrder)
+        {
+            VisualItem visual = kvp.Value;
+            if (visual != null && visual.RectTransform != null)
+            {
+                Destroy(visual.RectTransform.gameObject);
+            }
+        }
+        _activeVisualsByOrder.Clear();
+
+        foreach (KeyValuePair<int, Stack<VisualItem>> kvp in _pooledVisualsByLogicalIndex)
+        {
+            foreach (VisualItem visual in kvp.Value)
+            {
+                if (visual != null && visual.RectTransform != null)
+                {
+                    Destroy(visual.RectTransform.gameObject);
+                }
+            }
+        }
+        _pooledVisualsByLogicalIndex.Clear();
+
+        _measuredOrderSizes.Clear();
+        _centeredLogicalIndex = -1;
+    }
+
+    private void RefreshLinkedScrollbarState()
+    {
+        if (linked_scrollbar == null)
+        {
+            return;
+        }
+
+        bool canUseFiniteRange = IsFiniteMode() && _enabledIndices.Count > 0;
+        linked_scrollbar.interactable = canUseFiniteRange;
+
+        if (!canUseFiniteRange)
+        {
+            _suppressScrollbarCallback = true;
+            linked_scrollbar.size = 1f;
+            linked_scrollbar.SetValueWithoutNotify(invert_scrollbar_value ? 1f : 0f);
+            _suppressScrollbarCallback = false;
+            return;
+        }
+
+        GetFiniteOffsetBounds(out float minOffset, out float maxOffset);
+        float range = Mathf.Max(0f, maxOffset - minOffset);
+        float normalized = range > 0.0001f ? Mathf.Clamp01((_scrollOffset - minOffset) / range) : 0f;
+        if (invert_scrollbar_value)
+        {
+            normalized = 1f - normalized;
+        }
+
+        float visibleSpan = GetVisibleHalfExtent() * 2f;
+        float fullSpan = visibleSpan + range;
+        float size = fullSpan > 0.0001f ? Mathf.Clamp01(visibleSpan / fullSpan) : 1f;
+
+        _suppressScrollbarCallback = true;
+        linked_scrollbar.size = size;
+        linked_scrollbar.SetValueWithoutNotify(normalized);
+        _suppressScrollbarCallback = false;
+    }
+
+    private bool IsSharedVisualRecycleMode()
+    {
+        return item_source_mode == ScrollerItemSourceMode.SinglePrefabWithCount;
+    }
+
+    private int GetVisualPoolKey(int logicalIndex)
+    {
+        return IsSharedVisualRecycleMode() ? SharedSinglePrefabPoolKey : logicalIndex;
+    }
+
+    private void RebindLinkedScrollbarCallback()
+    {
+        if (_registeredScrollbar == linked_scrollbar)
+        {
+            return;
+        }
+
+        UnregisterLinkedScrollbarCallback();
+        RegisterLinkedScrollbarCallback();
+    }
+
+    private void RegisterLinkedScrollbarCallback()
+    {
+        if (linked_scrollbar == null)
+        {
+            return;
+        }
+
+        linked_scrollbar.onValueChanged.RemoveListener(OnScrollbarValueChanged);
+        linked_scrollbar.onValueChanged.AddListener(OnScrollbarValueChanged);
+        _registeredScrollbar = linked_scrollbar;
+    }
+
+    private void UnregisterLinkedScrollbarCallback()
+    {
+        if (_registeredScrollbar == null)
+        {
+            return;
+        }
+
+        _registeredScrollbar.onValueChanged.RemoveListener(OnScrollbarValueChanged);
+        _registeredScrollbar = null;
+    }
+
+    private bool IsFiniteMode()
+    {
+        return list_mode == ScrollerListMode.Finite;
+    }
+
+    private int ClampOrderForMode(int order)
+    {
+        if (!IsFiniteMode())
+        {
+            return order;
+        }
+
+        if (_enabledIndices.Count <= 0)
+        {
+            return 0;
+        }
+
+        return Mathf.Clamp(order, 0, _enabledIndices.Count - 1);
+    }
+
+    private float ClampOffsetForMode(float offset)
+    {
+        if (!IsFiniteMode() || _enabledIndices.Count == 0)
+        {
+            return offset;
+        }
+
+        GetFiniteOffsetBounds(out float minOffset, out float maxOffset);
+        return Mathf.Clamp(offset, minOffset, maxOffset);
+    }
+
+    private void GetFiniteOffsetBounds(out float minOffset, out float maxOffset)
+    {
+        int count = _enabledIndices.Count;
+        if (count <= 0)
+        {
+            minOffset = 0f;
+            maxOffset = 0f;
+            return;
+        }
+
+        float visibleHalfExtent = GetVisibleHalfExtent();
+        float firstCenter = GetOrderCenterPosition(0);
+        float lastCenter = GetOrderCenterPosition(count - 1);
+        float firstHalfSize = 0.5f * GetOrderPrimarySize(0);
+        float lastHalfSize = 0.5f * GetOrderPrimarySize(count - 1);
+
+        minOffset = firstCenter - (visibleHalfExtent - firstHalfSize);
+        maxOffset = lastCenter + (visibleHalfExtent - lastHalfSize);
+
+        if (minOffset > maxOffset)
+        {
+            float collapsed = 0.5f * (minOffset + maxOffset);
+            minOffset = collapsed;
+            maxOffset = collapsed;
+        }
+    }
+
     private static int Mod(int value, int count)
     {
         if (count <= 0)
@@ -1294,19 +1956,20 @@ public class ScrollerManager : MonoBehaviour
         return m < 0 ? m + count : m;
     }
 
-    private static int FloorDiv(int value, int divisor)
-    {
-        if (divisor == 0)
+        private static int FloorDiv(int value, int divisor)
         {
-            return 0;
-        }
+            if (divisor == 0)
+            {
+                return 0;
+            }
 
-        int q = value / divisor;
-        int r = value % divisor;
-        if (r != 0 && ((r < 0) != (divisor < 0)))
-        {
-            q--;
+            int q = value / divisor;
+            int r = value % divisor;
+            if (r != 0 && ((r < 0) != (divisor < 0)))
+            {
+                q--;
+            }
+            return q;
         }
-        return q;
     }
 }

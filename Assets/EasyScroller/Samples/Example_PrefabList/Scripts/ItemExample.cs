@@ -1,4 +1,5 @@
 using UnityEngine;
+using EasyScroller;
 
 public class ItemExample : MonoBehaviour
 {
@@ -34,6 +35,14 @@ public class ItemExample : MonoBehaviour
     {
         GetInfo();
         info.RequestRemoveSelf();
+    }
+
+    private void OnDestroy()
+    {
+        if (info != null)
+        {
+            info.OnCenteredStateChanged.RemoveListener(OnCenterStateChanged);
+        }
     }
 
     private void GetInfo()

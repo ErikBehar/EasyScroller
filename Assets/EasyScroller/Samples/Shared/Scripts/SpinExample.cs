@@ -1,4 +1,5 @@
 using UnityEngine;
+using EasyScroller;
 
 public class SpinExample : MonoBehaviour
 {
@@ -9,6 +10,12 @@ public class SpinExample : MonoBehaviour
 
     public void StartSpin()
     {
+        if (scroll_input == null)
+        {
+            Debug.LogWarning("SpinExample requires a ScrollerInputHandler reference.");
+            return;
+        }
+
         scroll_input.StartSpin(direction, speed, duration);
     }
 }

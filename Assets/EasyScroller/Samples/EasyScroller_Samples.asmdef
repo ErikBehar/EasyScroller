@@ -1,0 +1,16 @@
+{
+    "name": "EasyScroller_Samples",
+    "rootNamespace": "",
+    "references": [
+        "GUID:05a948285a475524aa7d67f12835fa79"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
