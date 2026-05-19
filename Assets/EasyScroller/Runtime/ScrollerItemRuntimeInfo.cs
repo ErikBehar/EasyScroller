@@ -25,8 +25,6 @@ namespace EasyScroller
         public int LogicalIndex => logical_index;
         /// <summary>Stable index into your data source; does not change when the runtime list is reordered.</summary>
         public int DataIndex => data_index;
-        /// <summary>Alias for <see cref="DataIndex"/>.</summary>
-        public int OriginalIndex => data_index;
         public RectTransform WrapperRect => wrapper_rect;
         public RectTransform ContentRect => content_rect;
         public ScrollerManager Manager => manager;
@@ -66,11 +64,6 @@ namespace EasyScroller
         public void SetDataIndex(int dataIndex)
         {
             data_index = dataIndex;
-        }
-
-        public void SetOriginalIndex(int dataIndex)
-        {
-            SetDataIndex(dataIndex);
         }
 
         public void SetManager(ScrollerManager scrollerManager)

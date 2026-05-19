@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
 namespace EasyScroller
@@ -47,8 +48,10 @@ namespace EasyScroller
         private float inertia_damping = 8f;
 
         [Header("Snap Spring")]
-        [SerializeField, Tooltip("Enable or disable automatic snapping to the nearest item.")]
+        [SerializeField, Tooltip("Enable or disable automatic snapping to the nearest item after drag/inertia stops.")]
         private bool enable_snapping = true;
+        [SerializeField, Tooltip("Smoothly animate CenterNext/Previous and scroll-to-index when animated=true. Independent of auto-snap.")]
+        private bool smooth_programmatic_scroll = true;
         [SerializeField, Tooltip("When speed falls below this, spring snapping to nearest center starts.")]
         private float snap_velocity_threshold = 40f;
         [SerializeField, Tooltip("Seconds to smoothly settle to the snap target.")]
@@ -107,6 +110,12 @@ namespace EasyScroller
         private Scrollbar linked_scrollbar;
         [SerializeField, Tooltip("Invert normalized scrollbar direction. Useful when top should map to value=1.")]
         private bool invert_scrollbar_value = false;
+        [SerializeField, Tooltip("How quickly linked-scrollbar drags ease the scroll offset toward the handle.")]
+        private float scrollbar_scroll_smooth_time = 0.08f;
+        [SerializeField, Tooltip("Max scroll speed when following the linked scrollbar (units/sec).")]
+        private float scrollbar_scroll_max_speed = 12000f;
+        [SerializeField, Tooltip("If the scrollbar target is farther than this from the current offset, jump instantly (track clicks). 0 = always smooth.")]
+        private float scrollbar_jump_distance_threshold = 120f;
 
         private class ItemState
         {
@@ -147,7 +156,9 @@ namespace EasyScroller
         private readonly List<ItemState> _items = new List<ItemState>();
         private readonly Dictionary<int, Stack<VisualItem>> _pooledVisualsByLogicalIndex = new Dictionary<int, Stack<VisualItem>>();
         private readonly List<int> _enabledIndices = new List<int>();
+        private readonly Dictionary<int, int> _enabledLogicalToSlot = new Dictionary<int, int>();
         private readonly List<float> _enabledPrefixPositions = new List<float>();
+        private readonly Stack<VisualItem> _poolFilterScratch = new Stack<VisualItem>();
         private readonly Vector3[] _worldCornersBuffer = new Vector3[4];
 
         // Chain endpoints ordered by ascending primary-axis position.
@@ -159,6 +170,7 @@ namespace EasyScroller
         private bool _isDragging;
         private int _centeredLogicalIndex = -1;
         private VisualItem _centeredChainVisual;
+        private VisualItem _lastCenteredBroadcastVisual;
         private RectTransform _containerRect;
         private float _enabledCycleLength;
         private int _sizeRefreshTickCounter;
@@ -178,6 +190,11 @@ namespace EasyScroller
         private bool _pendingInitialReveal;
         private bool _suppressScrollbarCallback;
         private Scrollbar _registeredScrollbar;
+        private LinkedScrollbarDragRelay _scrollbarDragRelay;
+        private float _scrollbarTargetOffset;
+        private float _scrollbarScrollVelocity;
+        private bool _scrollbarOffsetLeadsChain;
+        private bool _scrollbarPointerHeld;
         private float _lastScrollOffsetForChainMotion;
         private bool _skipCollectiveScrollThisFrame;
 
@@ -216,8 +233,6 @@ namespace EasyScroller
 
         void Update()
         {
-            RebindLinkedScrollbarCallback();
-
             if (_enabledIndices.Count == 0)
             {
                 DeactivateAllActiveVisuals();
@@ -240,25 +255,17 @@ namespace EasyScroller
                 _scrollVelocity = Mathf.Lerp(_scrollVelocity, 0f, inertia_damping * dt);
             }
 
-            // Snap stays off during relayout so it does not fight gap closure; drag
-            // and inertia are unaffected and still move the chain via collective motion.
-            if (enable_snapping && !_relayoutActive && !_isDragging && Mathf.Abs(_scrollVelocity) < snap_velocity_threshold)
+            // Spring toward an active snap target (programmatic next/prev or auto-snap).
+            if (_hasSnapTarget && !_relayoutActive && !_isDragging && Mathf.Abs(_scrollVelocity) < snap_velocity_threshold)
             {
-                if (!_hasSnapTarget)
+                if (IsVisualActiveInChain(_snapTargetChainVisual))
                 {
-                    BeginSnapToResolvedTargetVisual();
-                }
-                else if (IsVisualActiveInChain(_snapTargetChainVisual))
-                {
-                    // Target moves with the chain during the snap; keep tracking its axis.
                     _snapTargetOrder = _snapTargetChainVisual.AbsoluteOrderIndex;
                     _snapTargetOffset = ComputeScrollOffsetToCenterVisual(_snapTargetChainVisual);
                 }
 
                 _scrollOffset = Mathf.SmoothDamp(_scrollOffset, _snapTargetOffset, ref _snapVelocity, snap_smooth_time, snap_max_speed, dt);
                 _scrollOffset = ClampOffsetForMode(_scrollOffset);
-
-                // Prevent inertia from fighting snap while in settle mode.
                 _scrollVelocity = 0f;
 
                 bool centeredOnTarget = IsVisualActiveInChain(_snapTargetChainVisual) &&
@@ -275,10 +282,44 @@ namespace EasyScroller
                     _hasSnapTarget = false;
                 }
             }
-            else
+            else if (_hasSnapTarget)
             {
-                _hasSnapTarget = false;
-                _snapVelocity = 0f;
+                ClearActiveSnapState();
+            }
+
+            // Auto-snap after release only when enabled and nothing else is driving a target.
+            if (enable_snapping &&
+                !_hasSnapTarget &&
+                !_relayoutActive &&
+                !_isDragging &&
+                !_scrollbarOffsetLeadsChain &&
+                Mathf.Abs(_scrollVelocity) < snap_velocity_threshold)
+            {
+                BeginSnapToResolvedTargetVisual();
+            }
+
+            if (_scrollbarOffsetLeadsChain)
+            {
+                if (!TryJumpScrollbarOffsetToTarget())
+                {
+                    _scrollOffset = Mathf.SmoothDamp(
+                        _scrollOffset,
+                        _scrollbarTargetOffset,
+                        ref _scrollbarScrollVelocity,
+                        scrollbar_scroll_smooth_time,
+                        scrollbar_scroll_max_speed,
+                        dt);
+                    _scrollOffset = ClampOffsetForMode(_scrollOffset);
+                }
+
+                _scrollVelocity = 0f;
+
+                if (!_scrollbarPointerHeld &&
+                    Mathf.Abs(_scrollOffset - _scrollbarTargetOffset) <= snap_position_epsilon)
+                {
+                    _scrollbarOffsetLeadsChain = false;
+                    _scrollbarScrollVelocity = 0f;
+                }
             }
 
             if (Mathf.Abs(_scrollVelocity) < 0.005f && !_isDragging)
@@ -355,18 +396,43 @@ namespace EasyScroller
             return next;
         }
 
+        private int FindLogicalIndexByDataIndex(int dataIndex)
+        {
+            for (int i = 0; i < _items.Count; i++)
+            {
+                if (_items[i].DataIndex == dataIndex && _items[i].Enabled)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
         private void RefreshEnabledIndices()
         {
             _enabledIndices.Clear();
+            _enabledLogicalToSlot.Clear();
             for (int i = 0; i < _items.Count; i++)
             {
                 if (_items[i].Enabled)
                 {
+                    _enabledLogicalToSlot[i] = _enabledIndices.Count;
                     _enabledIndices.Add(i);
                 }
             }
 
             RebuildEnabledSpacingData();
+        }
+
+        private int GetEnabledSlot(int logicalIndex)
+        {
+            return _enabledLogicalToSlot.TryGetValue(logicalIndex, out int slot) ? slot : -1;
+        }
+
+        private bool IsLogicalEnabled(int logicalIndex)
+        {
+            return GetEnabledSlot(logicalIndex) >= 0;
         }
 
         private void ReindexSourcePrefabIndices()
@@ -558,7 +624,7 @@ namespace EasyScroller
 
         private int GetTargetOrderForLogicalIndex(int logicalIndex)
         {
-            int orderInEnabled = _enabledIndices.IndexOf(logicalIndex);
+            int orderInEnabled = GetEnabledSlot(logicalIndex);
             if (orderInEnabled < 0)
             {
                 return 0;
@@ -573,11 +639,22 @@ namespace EasyScroller
             int referenceOrder = GetReferenceOrderForProgrammaticNavigation();
             int cycle = FloorDiv(referenceOrder, count);
             int candidate = (cycle * count) + orderInEnabled;
+            return RefineOrderToNearestCycle(candidate, _scrollOffset);
+        }
+
+        private int RefineOrderToNearestCycle(int candidate, float referenceOffset)
+        {
+            int count = _enabledIndices.Count;
+            if (IsFiniteMode() || count <= 0)
+            {
+                return candidate;
+            }
+
             int candidatePlus = candidate + count;
             int candidateMinus = candidate - count;
-            float referenceOffset = _scrollOffset;
             float bestDistance = Mathf.Abs(GetOrderCenterPosition(candidate) - referenceOffset);
             int bestOrder = candidate;
+
             float plusDistance = Mathf.Abs(GetOrderCenterPosition(candidatePlus) - referenceOffset);
             if (plusDistance < bestDistance)
             {
@@ -701,6 +778,55 @@ namespace EasyScroller
             return FindChainVisualByOrder(targetOrder);
         }
 
+        private void StopUserMotionForProgrammaticScroll()
+        {
+            _isDragging = false;
+            _scrollVelocity = 0f;
+            _snapVelocity = 0f;
+        }
+
+        private void BeginAnimatedSnapToVisual(VisualItem targetVisual)
+        {
+            _snapTargetChainVisual = targetVisual;
+            _snapTargetOrder = targetVisual.AbsoluteOrderIndex;
+            _snapTargetOffset = ComputeScrollOffsetToCenterVisual(targetVisual);
+            _hasSnapTarget = true;
+            _snapTargetLockedUntilUserInput = true;
+        }
+
+        private void ApplyScrollOffsetToChainImmediately()
+        {
+            if (_chainHead == null)
+            {
+                _lastScrollOffsetForChainMotion = _scrollOffset;
+                return;
+            }
+
+            float scrollDelta = _scrollOffset - _lastScrollOffsetForChainMotion;
+            if (Mathf.Abs(scrollDelta) > 0.0001f)
+            {
+                ApplyCollectiveMovementToChain(-scrollDelta);
+            }
+
+            _lastScrollOffsetForChainMotion = _scrollOffset;
+            _skipCollectiveScrollThisFrame = true;
+        }
+
+        private void SettleScrollAtVisual(VisualItem targetVisual)
+        {
+            _scrollOffset = ClampOffsetForMode(ComputeScrollOffsetToCenterVisual(targetVisual));
+            ClearActiveSnapState();
+            _hasSettledOrder = true;
+            _settledOrder = targetVisual.AbsoluteOrderIndex;
+            _settledChainVisual = targetVisual;
+            ApplyScrollOffsetToChainImmediately();
+        }
+
+        private bool ShouldSmoothProgrammaticScroll(bool animated)
+        {
+            return animated && smooth_programmatic_scroll;
+        }
+
         private bool CenterChainVisual(VisualItem targetVisual, bool animated = true)
         {
             if (!IsVisualActiveInChain(targetVisual))
@@ -708,30 +834,17 @@ namespace EasyScroller
                 return false;
             }
 
-            _isDragging = false;
-            _scrollVelocity = 0f;
-            _snapVelocity = 0f;
+            StopUserMotionForProgrammaticScroll();
             _hasProgrammaticStepAnchor = true;
             _programmaticStepOrder = targetVisual.AbsoluteOrderIndex;
 
-            if (animated && enable_snapping)
+            if (ShouldSmoothProgrammaticScroll(animated))
             {
-                _snapTargetChainVisual = targetVisual;
-                _snapTargetOrder = targetVisual.AbsoluteOrderIndex;
-                _snapTargetOffset = ComputeScrollOffsetToCenterVisual(targetVisual);
-                _hasSnapTarget = true;
-                _snapTargetLockedUntilUserInput = true;
+                BeginAnimatedSnapToVisual(targetVisual);
             }
             else
             {
-                _scrollOffset = ClampOffsetForMode(ComputeScrollOffsetToCenterVisual(targetVisual));
-                _hasSnapTarget = false;
-                _snapTargetLockedUntilUserInput = false;
-                _hasSettledOrder = true;
-                _settledOrder = targetVisual.AbsoluteOrderIndex;
-                _settledChainVisual = targetVisual;
-                _skipCollectiveScrollThisFrame = true;
-                _lastScrollOffsetForChainMotion = _scrollOffset;
+                SettleScrollAtVisual(targetVisual);
             }
 
             SyncVisibleWindow();
@@ -758,10 +871,10 @@ namespace EasyScroller
             {
                 int targetOrder = ClampOrderForMode(current.AbsoluteOrderIndex + (sign * steps));
                 float targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
-                return ScrollToOffsetAndOrder(targetOffset, targetOrder, enable_snapping);
+                return ScrollToOffsetAndOrder(targetOffset, targetOrder, true);
             }
 
-            return CenterChainVisual(target, enable_snapping);
+            return CenterChainVisual(target, animated: true);
         }
 
         private bool ScrollToOffsetAndOrder(float targetOffset, int targetOrder, bool animated)
@@ -771,39 +884,35 @@ namespace EasyScroller
                 return false;
             }
 
-            _isDragging = false;
-            _scrollVelocity = 0f;
-            _snapVelocity = 0f;
+            StopUserMotionForProgrammaticScroll();
             _hasProgrammaticStepAnchor = true;
             _programmaticStepOrder = ClampOrderForMode(targetOrder);
 
-            if (animated && enable_snapping)
+            if (ShouldSmoothProgrammaticScroll(animated))
             {
-                _snapTargetOrder = _programmaticStepOrder;
-                _snapTargetChainVisual = FindChainVisualByOrder(_programmaticStepOrder);
-                if (IsVisualActiveInChain(_snapTargetChainVisual))
+                VisualItem targetVisual = FindChainVisualByOrder(_programmaticStepOrder);
+                if (IsVisualActiveInChain(targetVisual))
                 {
-                    _snapTargetOffset = ComputeScrollOffsetToCenterVisual(_snapTargetChainVisual);
+                    BeginAnimatedSnapToVisual(targetVisual);
                 }
                 else
                 {
                     _snapTargetChainVisual = null;
+                    _snapTargetOrder = _programmaticStepOrder;
                     _snapTargetOffset = targetOffset;
+                    _hasSnapTarget = true;
+                    _snapTargetLockedUntilUserInput = true;
                 }
-                _hasSnapTarget = true;
-                _snapTargetLockedUntilUserInput = true;
             }
             else
             {
-                _scrollOffset = targetOffset;
-                _hasSnapTarget = false;
-                _snapTargetLockedUntilUserInput = false;
+                _scrollOffset = ClampOffsetForMode(targetOffset);
+                ClearActiveSnapState();
                 _hasSettledOrder = true;
                 _settledOrder = _programmaticStepOrder;
                 _settledChainVisual = FindChainVisualByOrder(_programmaticStepOrder);
                 _relayoutActive = false;
-                _skipCollectiveScrollThisFrame = true;
-                _lastScrollOffsetForChainMotion = _scrollOffset;
+                ApplyScrollOffsetToChainImmediately();
             }
 
             SyncVisibleWindow();
@@ -923,7 +1032,10 @@ namespace EasyScroller
 
             // Keep the abstract scroll metric aligned with the live chain when idle.
             // While dragging, coasting, or snapping, offset leads and visuals follow.
-            bool offsetLeadsChain = IsUserActivelyScrolling() || _hasSnapTarget;
+            bool offsetLeadsChain = IsUserActivelyScrolling() ||
+                                    _hasSnapTarget ||
+                                    _hasProgrammaticStepAnchor ||
+                                    _scrollbarOffsetLeadsChain;
             if (!offsetLeadsChain)
             {
                 SyncScrollOffsetFromChainCenter();
@@ -931,8 +1043,9 @@ namespace EasyScroller
             }
 
             // 5) Grow / trim coverage at chain edges.
-            GrowChainCoverage();
-            TrimChainCoverage();
+            float halfExtent = GetVisibleHalfExtent();
+            GrowChainCoverage(halfExtent);
+            TrimChainCoverage(halfExtent);
 
             // Center highlight follows whichever chain visual is actually nearest
             // the viewport axis — not the abstract lattice order (which drifts
@@ -940,7 +1053,7 @@ namespace EasyScroller
             RefreshCenteredVisualFromChain();
 
             // 6) Apply scaling, alpha.
-            UpdateVisualPresentation();
+            UpdateVisualPresentation(halfExtent);
 
             // 7) Decide whether the relayout has settled.
             CheckRelayoutSettle();
@@ -1121,9 +1234,7 @@ namespace EasyScroller
             while (v != null)
             {
                 VisualItem next = v.Next;
-                int slot = v.LogicalIndex >= 0 && v.LogicalIndex < _items.Count && _items[v.LogicalIndex].Enabled
-                    ? _enabledIndices.IndexOf(v.LogicalIndex)
-                    : -1;
+                int slot = GetEnabledSlot(v.LogicalIndex);
                 if (slot < 0)
                 {
                     DetachFromChain(v);
@@ -1145,8 +1256,8 @@ namespace EasyScroller
             v = _chainHead;
             while (v != null && v.Next != null)
             {
-                int slotV = _enabledIndices.IndexOf(v.LogicalIndex);
-                int slotNext = _enabledIndices.IndexOf(v.Next.LogicalIndex);
+                int slotV = GetEnabledSlot(v.LogicalIndex);
+                int slotNext = GetEnabledSlot(v.Next.LogicalIndex);
                 bool sequential = slotV >= 0 && slotNext >= 0 && IsLogicallySequentialForward(slotV, slotNext, count);
                 if (!sequential)
                 {
@@ -1223,9 +1334,7 @@ namespace EasyScroller
 
             if (_chainHead != null)
             {
-                VisualItem prefer = IsVisualActiveInChain(_relayoutBiasChainVisual)
-                    ? _relayoutBiasChainVisual
-                    : _settledChainVisual;
+                VisualItem prefer = GetActiveRelayoutBiasVisual() ?? _settledChainVisual;
                 return FindChainVisualNearestToAxis(0f, prefer);
             }
 
@@ -1262,9 +1371,7 @@ namespace EasyScroller
                 return;
             }
 
-            VisualItem preferHighlight = IsVisualActiveInChain(_relayoutBiasChainVisual)
-                ? _relayoutBiasChainVisual
-                : _centeredChainVisual;
+            VisualItem preferHighlight = GetActiveRelayoutBiasVisual() ?? _centeredChainVisual;
 
             // Hysteresis: keep the current highlighted visual while it remains
             // close enough to center, even if another item is slightly nearer.
@@ -1311,24 +1418,9 @@ namespace EasyScroller
             return null;
         }
 
-        private VisualItem FindVisualByRuntimeInfo(ScrollerItemRuntimeInfo runtimeInfo)
+        private VisualItem GetActiveRelayoutBiasVisual()
         {
-            if (runtimeInfo == null)
-            {
-                return null;
-            }
-
-            VisualItem v = _chainHead;
-            while (v != null)
-            {
-                if (v.RuntimeInfo == runtimeInfo)
-                {
-                    return v;
-                }
-                v = v.Next;
-            }
-
-            return null;
+            return IsVisualActiveInChain(_relayoutBiasChainVisual) ? _relayoutBiasChainVisual : null;
         }
 
         private void TryAssignRelayoutBiasBeforeRemoving(
@@ -1382,17 +1474,20 @@ namespace EasyScroller
         {
             VisualItem best = null;
             float bestDist = float.MaxValue;
-            float tieEpsilon = 0.05f;
+            float bestAxis = 0f;
+            const float tieEpsilon = 0.05f;
             VisualItem v = _chainHead;
             while (v != null)
             {
-                float d = Mathf.Abs(GetVisualAxis(v) - targetAxis);
+                float axis = GetVisualAxis(v);
+                float d = Mathf.Abs(axis - targetAxis);
                 if (d < bestDist - tieEpsilon)
                 {
                     bestDist = d;
                     best = v;
+                    bestAxis = axis;
                 }
-                else if (d <= bestDist + tieEpsilon && best != null)
+                else if (best != null && d <= bestDist + tieEpsilon)
                 {
                     if (preferIfTied != null)
                     {
@@ -1400,22 +1495,16 @@ namespace EasyScroller
                         {
                             best = v;
                             bestDist = d;
+                            bestAxis = axis;
                         }
                     }
-                    else
+                    else if (axis > bestAxis)
                     {
                         // Deterministic tie-break: prefer the item on the positive axis side.
-                        if (GetVisualAxis(v) > GetVisualAxis(best))
-                        {
-                            best = v;
-                            bestDist = d;
-                        }
+                        best = v;
+                        bestDist = d;
+                        bestAxis = axis;
                     }
-                }
-                else if (best == null)
-                {
-                    bestDist = d;
-                    best = v;
                 }
 
                 v = v.Next;
@@ -1441,14 +1530,13 @@ namespace EasyScroller
             }
         }
 
-        private void GrowChainCoverage()
+        private void GrowChainCoverage(float halfExtent)
         {
             if (_chainHead == null || _enabledIndices.Count == 0)
             {
                 return;
             }
 
-            float halfExtent = GetVisibleHalfExtent();
             GrowChainDirection(forward: true, halfExtent);
             GrowChainDirection(forward: false, halfExtent);
         }
@@ -1477,11 +1565,13 @@ namespace EasyScroller
                     return;
                 }
 
+                float edgeAxis = GetVisualAxis(edge);
+                float edgeHalf = GetVisualHalfSize(edge);
                 // Anticipate the placement of the new visual to decide whether
                 // it would be inside the strict viewport or fall into buffer.
                 float prospectiveHalf = 0.5f * _items[nextLogical].Height;
-                float gap = GetVisualHalfSize(edge) + prospectiveHalf + item_gap;
-                float prospectiveAxis = GetVisualAxis(edge) + (forward ? gap : -gap);
+                float gap = edgeHalf + prospectiveHalf + item_gap;
+                float prospectiveAxis = edgeAxis + (forward ? gap : -gap);
 
                 bool inStrictViewport = prospectiveAxis >= -halfExtent && prospectiveAxis <= halfExtent;
                 if (!inStrictViewport && bufferRemaining <= 0)
@@ -1505,8 +1595,8 @@ namespace EasyScroller
                 }
 
                 // Use the freshly measured half-size for actual placement.
-                float actualGap = GetVisualHalfSize(edge) + GetVisualHalfSize(next) + item_gap;
-                float actualAxis = GetVisualAxis(edge) + (forward ? actualGap : -actualGap);
+                float actualGap = edgeHalf + GetVisualHalfSize(next) + item_gap;
+                float actualAxis = edgeAxis + (forward ? actualGap : -actualGap);
                 SetVisualAxis(next, actualAxis);
                 next.SnapToTargetOnPrepare = true;
                 next.HiddenFramesRemaining = _pendingInitialReveal ? 0 : 1;
@@ -1518,53 +1608,46 @@ namespace EasyScroller
             }
         }
 
-        private void TrimChainCoverage()
+        private void TrimChainCoverage(float halfExtent)
         {
             if (_chainHead == null)
             {
                 return;
             }
 
-            float halfExtent = GetVisibleHalfExtent();
             int bufferAllowance = Mathf.Max(0, buffer_item_count);
+            float strictMin = -halfExtent;
 
-            // Trim head side: drop head visuals whose center is past
-            // -halfExtent while keeping at most buffer_item_count outside.
-            while (_chainHead != null && _chainHead != _chainTail)
+            int headOutside = CountChainOutsideFromHead(strictMin);
+            while (_chainHead != null && _chainHead != _chainTail && headOutside > bufferAllowance)
             {
                 VisualItem head = _chainHead;
-                if (GetVisualAxis(head) >= -halfExtent)
+                if (GetVisualAxis(head) >= strictMin)
                 {
                     break;
                 }
-                int outsideCount = CountChainOutsideHeadSide(-halfExtent);
-                if (outsideCount <= bufferAllowance)
-                {
-                    break;
-                }
+
                 DetachFromChain(head);
                 ReleaseVisual(head);
+                headOutside--;
             }
 
-            // Trim tail side similarly.
-            while (_chainTail != null && _chainHead != _chainTail)
+            int tailOutside = CountChainOutsideFromTail(halfExtent);
+            while (_chainTail != null && _chainHead != _chainTail && tailOutside > bufferAllowance)
             {
                 VisualItem tail = _chainTail;
                 if (GetVisualAxis(tail) <= halfExtent)
                 {
                     break;
                 }
-                int outsideCount = CountChainOutsideTailSide(halfExtent);
-                if (outsideCount <= bufferAllowance)
-                {
-                    break;
-                }
+
                 DetachFromChain(tail);
                 ReleaseVisual(tail);
+                tailOutside--;
             }
         }
 
-        private int CountChainOutsideHeadSide(float strictMin)
+        private int CountChainOutsideFromHead(float strictMin)
         {
             int count = 0;
             VisualItem v = _chainHead;
@@ -1576,7 +1659,7 @@ namespace EasyScroller
             return count;
         }
 
-        private int CountChainOutsideTailSide(float strictMax)
+        private int CountChainOutsideFromTail(float strictMax)
         {
             int count = 0;
             VisualItem v = _chainTail;
@@ -1588,9 +1671,8 @@ namespace EasyScroller
             return count;
         }
 
-        private void UpdateVisualPresentation()
+        private void UpdateVisualPresentation(float halfExtent)
         {
-            float halfExtent = GetVisibleHalfExtent();
             float dt = Time.deltaTime;
 
             VisualItem v = _chainHead;
@@ -2075,8 +2157,7 @@ namespace EasyScroller
             {
                 // Do not clear _scrollVelocity — the user may be scrolling while
                 // items are removed. Only interrupt snap so it does not fight relayout.
-                _snapVelocity = 0f;
-                _hasSnapTarget = false;
+                ClearActiveSnapState();
             }
 
             RefreshEnabledIndices();
@@ -2089,12 +2170,11 @@ namespace EasyScroller
                 _centeredChainVisual = null;
                 _scrollOffset = 0f;
                 _scrollVelocity = 0f;
-                _snapVelocity = 0f;
-                _hasSnapTarget = false;
+                ClearActiveSnapState();
                 _hasSettledOrder = false;
                 _settledChainVisual = null;
-                _snapTargetChainVisual = null;
                 _hasProgrammaticStepAnchor = false;
+                _lastCenteredBroadcastVisual = null;
                 EndRelayout();
                 RefreshLinkedScrollbarState();
                 return;
@@ -2132,7 +2212,7 @@ namespace EasyScroller
                 {
                     reAnchor = stabilityAnchor;
                 }
-                else if (_chainHead != null)
+                else
                 {
                     reAnchor = FindChainVisualNearestToAxis(stabilityAxis, relayoutBiasSuccessor);
                     if (reAnchor != null)
@@ -2141,7 +2221,7 @@ namespace EasyScroller
                     }
                 }
 
-                if (reAnchor != null && reAnchor.LogicalIndex >= 0 && _enabledIndices.IndexOf(reAnchor.LogicalIndex) >= 0)
+                if (reAnchor != null && IsLogicalEnabled(reAnchor.LogicalIndex))
                 {
                     int newOrder = ComputeNearestOrderForLogical(reAnchor.LogicalIndex, _scrollOffset);
                     float newLattice = GetOrderCenterPosition(newOrder);
@@ -2173,8 +2253,7 @@ namespace EasyScroller
             {
                 VisualItem next = v.Next;
                 int logical = v.LogicalIndex;
-                bool stillEnabled = logical >= 0 && logical < _items.Count && _items[logical].Enabled;
-                if (!stillEnabled)
+                if (!IsLogicalEnabled(logical))
                 {
                     TryAssignRelayoutBiasBeforeRemoving(v, logical);
                     DetachFromChain(v);
@@ -2186,11 +2265,12 @@ namespace EasyScroller
 
         private int ComputeNearestOrderForLogical(int logicalIndex, float referenceOffset)
         {
-            int orderInEnabled = _enabledIndices.IndexOf(logicalIndex);
+            int orderInEnabled = GetEnabledSlot(logicalIndex);
             if (orderInEnabled < 0)
             {
                 return 0;
             }
+
             if (IsFiniteMode())
             {
                 return orderInEnabled;
@@ -2200,22 +2280,15 @@ namespace EasyScroller
             float prefix = _enabledPrefixPositions[orderInEnabled];
             int cycle = Mathf.RoundToInt((referenceOffset - prefix) / _enabledCycleLength);
             int candidate = (cycle * count) + orderInEnabled;
-            int candidatePlus = candidate + count;
-            int candidateMinus = candidate - count;
-            float bestDistance = Mathf.Abs(GetOrderCenterPosition(candidate) - referenceOffset);
-            int bestOrder = candidate;
-            float plusDistance = Mathf.Abs(GetOrderCenterPosition(candidatePlus) - referenceOffset);
-            if (plusDistance < bestDistance)
-            {
-                bestDistance = plusDistance;
-                bestOrder = candidatePlus;
-            }
-            float minusDistance = Mathf.Abs(GetOrderCenterPosition(candidateMinus) - referenceOffset);
-            if (minusDistance < bestDistance)
-            {
-                bestOrder = candidateMinus;
-            }
-            return bestOrder;
+            return RefineOrderToNearestCycle(candidate, referenceOffset);
+        }
+
+        private void ClearActiveSnapState()
+        {
+            _snapVelocity = 0f;
+            _hasSnapTarget = false;
+            _snapTargetLockedUntilUserInput = false;
+            _snapTargetChainVisual = null;
         }
 
         private void SyncSinglePrefabCountFromEnabledItems()
@@ -2290,37 +2363,39 @@ namespace EasyScroller
             // Pick the relayout bias winner from the deleteSelf instance (or the copy
             // nearest center) BEFORE any detach — purging every matching logical can
             // reorder the chain and invalidate Next/Prev on the centered node.
-            VisualItem pinSource = FindVisualByRuntimeInfo(requester);
-            if (pinSource == null)
+            VisualItem biasSource = null;
+            bool forceBias = false;
+            float bestDist = float.MaxValue;
+            VisualItem v = _chainHead;
+            while (v != null)
             {
-                float bestDist = float.MaxValue;
-                VisualItem scan = _chainHead;
-                while (scan != null)
+                if (v.LogicalIndex == logicalIndex)
                 {
-                    if (scan.LogicalIndex == logicalIndex)
+                    if (requester != null && v.RuntimeInfo == requester)
                     {
-                        float dist = Mathf.Abs(GetVisualAxis(scan));
+                        biasSource = v;
+                        forceBias = true;
+                    }
+                    else if (!forceBias)
+                    {
+                        float dist = Mathf.Abs(GetVisualAxis(v));
                         if (dist < bestDist)
                         {
                             bestDist = dist;
-                            pinSource = scan;
+                            biasSource = v;
                         }
                     }
-                    scan = scan.Next;
                 }
+
+                v = v.Next;
             }
 
-            if (pinSource != null)
+            if (biasSource != null)
             {
-                bool forceBias = requester != null && pinSource.RuntimeInfo == requester;
-                TryAssignRelayoutBiasBeforeRemoving(pinSource, logicalIndex, forceBias);
+                TryAssignRelayoutBiasBeforeRemoving(biasSource, logicalIndex, forceBias);
             }
 
-            // Remove any chain visuals matching this logical. The chain is
-            // implicitly stitched together as siblings are detached, so
-            // neighbors will automatically close the visual gap during the
-            // next propagate pass.
-            VisualItem v = _chainHead;
+            v = _chainHead;
             while (v != null)
             {
                 VisualItem next = v.Next;
@@ -2336,6 +2411,7 @@ namespace EasyScroller
                         Destroy(v.RectTransform.gameObject);
                     }
                 }
+
                 v = next;
             }
 
@@ -2347,7 +2423,7 @@ namespace EasyScroller
 
             if (IsSharedVisualRecycleMode())
             {
-                Stack<VisualItem> retained = new Stack<VisualItem>();
+                _poolFilterScratch.Clear();
                 while (pool.Count > 0)
                 {
                     VisualItem pooledVisual = pool.Pop();
@@ -2362,19 +2438,20 @@ namespace EasyScroller
                     }
                     else
                     {
-                        retained.Push(pooledVisual);
+                        _poolFilterScratch.Push(pooledVisual);
                     }
                 }
 
-                while (retained.Count > 0)
+                while (_poolFilterScratch.Count > 0)
                 {
-                    pool.Push(retained.Pop());
+                    pool.Push(_poolFilterScratch.Pop());
                 }
             }
             else
             {
-                foreach (VisualItem pooledVisual in pool)
+                while (pool.Count > 0)
                 {
+                    VisualItem pooledVisual = pool.Pop();
                     if (pooledVisual != null && pooledVisual.RectTransform != null)
                     {
                         Destroy(pooledVisual.RectTransform.gameObject);
@@ -2418,8 +2495,10 @@ namespace EasyScroller
 
             foreach (KeyValuePair<int, Stack<VisualItem>> kvp in _pooledVisualsByLogicalIndex)
             {
-                foreach (VisualItem pooled in kvp.Value)
+                Stack<VisualItem> pool = kvp.Value;
+                while (pool.Count > 0)
                 {
+                    VisualItem pooled = pool.Pop();
                     if (pooled != null && pooled.RectTransform != null)
                     {
                         Destroy(pooled.RectTransform.gameObject);
@@ -2430,6 +2509,7 @@ namespace EasyScroller
 
             _centeredLogicalIndex = -1;
             _centeredChainVisual = null;
+            _lastCenteredBroadcastVisual = null;
             _snapTargetChainVisual = null;
             _settledChainVisual = null;
         }
@@ -2451,15 +2531,22 @@ namespace EasyScroller
 
         private void BroadcastCenteredState()
         {
-            VisualItem v = _chainHead;
-            while (v != null)
+            if (_centeredChainVisual == _lastCenteredBroadcastVisual)
             {
-                if (v.RuntimeInfo != null)
-                {
-                    v.RuntimeInfo.SetCentered(v == _centeredChainVisual);
-                }
-                v = v.Next;
+                return;
             }
+
+            if (_lastCenteredBroadcastVisual != null && _lastCenteredBroadcastVisual.RuntimeInfo != null)
+            {
+                _lastCenteredBroadcastVisual.RuntimeInfo.SetCentered(false);
+            }
+
+            if (_centeredChainVisual != null && _centeredChainVisual.RuntimeInfo != null)
+            {
+                _centeredChainVisual.RuntimeInfo.SetCentered(true);
+            }
+
+            _lastCenteredBroadcastVisual = _centeredChainVisual;
         }
 
         // -----------------------------------------------------------------
@@ -2499,7 +2586,11 @@ namespace EasyScroller
 
             _suppressScrollbarCallback = true;
             linked_scrollbar.size = size;
-            linked_scrollbar.SetValueWithoutNotify(normalized);
+            if (!_scrollbarPointerHeld)
+            {
+                linked_scrollbar.SetValueWithoutNotify(normalized);
+            }
+
             _suppressScrollbarCallback = false;
         }
 
@@ -2534,6 +2625,7 @@ namespace EasyScroller
             linked_scrollbar.onValueChanged.RemoveListener(OnScrollbarValueChanged);
             linked_scrollbar.onValueChanged.AddListener(OnScrollbarValueChanged);
             _registeredScrollbar = linked_scrollbar;
+            EnsureScrollbarDragRelay();
         }
 
         private void UnregisterLinkedScrollbarCallback()
@@ -2545,6 +2637,28 @@ namespace EasyScroller
 
             _registeredScrollbar.onValueChanged.RemoveListener(OnScrollbarValueChanged);
             _registeredScrollbar = null;
+            _scrollbarPointerHeld = false;
+            _scrollbarOffsetLeadsChain = false;
+            _scrollbarScrollVelocity = 0f;
+        }
+
+        private void EnsureScrollbarDragRelay()
+        {
+            if (linked_scrollbar == null)
+            {
+                return;
+            }
+
+            if (_scrollbarDragRelay == null)
+            {
+                _scrollbarDragRelay = linked_scrollbar.GetComponent<LinkedScrollbarDragRelay>();
+                if (_scrollbarDragRelay == null)
+                {
+                    _scrollbarDragRelay = linked_scrollbar.gameObject.AddComponent<LinkedScrollbarDragRelay>();
+                }
+            }
+
+            _scrollbarDragRelay.Bind(this);
         }
 
         private bool IsFiniteMode()
@@ -2554,7 +2668,57 @@ namespace EasyScroller
 
         private bool IsUserActivelyScrolling()
         {
-            return _isDragging || Mathf.Abs(_scrollVelocity) > 0.001f;
+            return _isDragging || _scrollbarPointerHeld || Mathf.Abs(_scrollVelocity) > 0.001f;
+        }
+
+        private void ApplyLinkedScrollbarNormalizedValue(float effectiveValue)
+        {
+            GetFiniteOffsetBounds(out float minOffset, out float maxOffset);
+            _scrollbarTargetOffset = ClampOffsetForMode(Mathf.Lerp(minOffset, maxOffset, effectiveValue));
+            _scrollbarOffsetLeadsChain = true;
+            _scrollVelocity = 0f;
+            ClearActiveSnapState();
+            _hasProgrammaticStepAnchor = false;
+            TryJumpScrollbarOffsetToTarget();
+        }
+
+        /// <summary>
+        /// Instantly commits the scrollbar target when it is far from the current offset (e.g. track click).
+        /// </summary>
+        /// <returns>True if an instant jump was applied.</returns>
+        private bool TryJumpScrollbarOffsetToTarget()
+        {
+            if (scrollbar_jump_distance_threshold <= 0f)
+            {
+                return false;
+            }
+
+            float delta = Mathf.Abs(_scrollbarTargetOffset - _scrollOffset);
+            if (delta < scrollbar_jump_distance_threshold)
+            {
+                return false;
+            }
+
+            _scrollOffset = _scrollbarTargetOffset;
+            _scrollbarScrollVelocity = 0f;
+            ApplyScrollOffsetToChainImmediately();
+            return true;
+        }
+
+        internal void NotifyLinkedScrollbarPointerDown()
+        {
+            _scrollbarPointerHeld = true;
+            _scrollbarOffsetLeadsChain = true;
+            _scrollbarTargetOffset = _scrollOffset;
+            _scrollbarScrollVelocity = 0f;
+            _scrollVelocity = 0f;
+            ClearActiveSnapState();
+            _hasProgrammaticStepAnchor = false;
+        }
+
+        internal void NotifyLinkedScrollbarPointerUp()
+        {
+            _scrollbarPointerHeld = false;
         }
 
         private int ClampOrderForMode(int order)
@@ -2635,6 +2799,26 @@ namespace EasyScroller
                 q--;
             }
             return q;
+        }
+
+        private sealed class LinkedScrollbarDragRelay : MonoBehaviour, IPointerDownHandler, IPointerUpHandler
+        {
+            private ScrollerManager _owner;
+
+            public void Bind(ScrollerManager owner)
+            {
+                _owner = owner;
+            }
+
+            public void OnPointerDown(PointerEventData eventData)
+            {
+                _owner?.NotifyLinkedScrollbarPointerDown();
+            }
+
+            public void OnPointerUp(PointerEventData eventData)
+            {
+                _owner?.NotifyLinkedScrollbarPointerUp();
+            }
         }
     }
 }

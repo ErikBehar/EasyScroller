@@ -19,14 +19,13 @@ Created as a test for a UI job and refined further afterwards.
 - Infinite or finite list modes; finite mode supports an optional scrollbar
 - Visual recycling in single-prefab mode
 - Separate input handling
-- Runtime add / remove / reorder
+- Runtime add / remove / reorder; scroll by logical or stable data index
 - Item events: centered state, content refresh on pool rebind
-- Optional hide-until-initial-settle
 
 ## Requirements
 
 - Tested on Unity 6.3.13f1
-- Packages: UGUI, Input System; TextMeshPro optional (demos)
+- Required Packages: UGUI, Input System; TextMeshPro optional (used in samples)
 - Scene: EventSystem + Input System UI Input Module
 
 ## Notes

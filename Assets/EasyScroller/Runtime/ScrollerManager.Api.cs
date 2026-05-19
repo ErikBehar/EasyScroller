@@ -63,17 +63,7 @@ namespace EasyScroller
                 effectiveValue = 1f - effectiveValue;
             }
 
-            GetFiniteOffsetBounds(out float minOffset, out float maxOffset);
-            float targetOffset = Mathf.Lerp(minOffset, maxOffset, effectiveValue);
-
-            _scrollOffset = ClampOffsetForMode(targetOffset);
-            _scrollVelocity = 0f;
-            _snapVelocity = 0f;
-            _hasSnapTarget = false;
-            _snapTargetLockedUntilUserInput = false;
-            _hasProgrammaticStepAnchor = false;
-            SyncVisibleWindow();
-            RefreshLinkedScrollbarState();
+            ApplyLinkedScrollbarNormalizedValue(effectiveValue);
         }
 
         /// <summary>
@@ -180,21 +170,21 @@ namespace EasyScroller
         }
 
         /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="ScrollToOriginalIndex(int, bool)"/> (animated).
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToDataIndex(int, bool)"/> (animated).
         /// </summary>
-        /// <param name="originalIndex">Target original item index.</param>
-        public void ScrollToOriginalIndexNoRet(int originalIndex)
+        /// <param name="dataIndex">Stable data index to locate.</param>
+        public void ScrollToDataIndexNoRet(int dataIndex)
         {
-            ScrollToOriginalIndex(originalIndex);
+            ScrollToDataIndex(dataIndex);
         }
 
         /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="ScrollToOriginalIndex(int, bool)"/> (instant).
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToDataIndex(int, bool)"/> (instant).
         /// </summary>
-        /// <param name="originalIndex">Target original item index.</param>
-        public void JumpToOriginalIndexNoRet(int originalIndex)
+        /// <param name="dataIndex">Stable data index to locate.</param>
+        public void JumpToDataIndexNoRet(int dataIndex)
         {
-            ScrollToOriginalIndex(originalIndex, false);
+            ScrollToDataIndex(dataIndex, false);
         }
 
         /// <summary>
@@ -476,23 +466,14 @@ namespace EasyScroller
         }
 
         /// <summary>
-        /// Scrolls or jumps to the first enabled item matching an original source index.
+        /// Scrolls or jumps to the first enabled item matching a stable data index.
         /// </summary>
-        /// <param name="originalIndex">Original source index to locate.</param>
+        /// <param name="dataIndex">Data index to locate.</param>
         /// <param name="animated">True to animate via snap; false to jump instantly.</param>
         /// <returns>True if a matching enabled item exists; otherwise false.</returns>
-        public bool ScrollToOriginalIndex(int originalIndex, bool animated = true)
+        public bool ScrollToDataIndex(int dataIndex, bool animated = true)
         {
-            int logicalIndex = -1;
-            for (int i = 0; i < _items.Count; i++)
-            {
-                if (_items[i].DataIndex == originalIndex && _items[i].Enabled)
-                {
-                    logicalIndex = i;
-                    break;
-                }
-            }
-
+            int logicalIndex = FindLogicalIndexByDataIndex(dataIndex);
             if (logicalIndex < 0)
             {
                 return false;
@@ -571,10 +552,7 @@ namespace EasyScroller
         {
             _isDragging = true;
             _scrollVelocity = 0f;
-            _snapVelocity = 0f;
-            _hasSnapTarget = false;
-            _snapTargetLockedUntilUserInput = false;
-            _snapTargetChainVisual = null;
+            ClearActiveSnapState();
             _hasProgrammaticStepAnchor = false;
         }
 

@@ -162,57 +162,57 @@ namespace EasyScroller
                 return;
             }
 
-        Mouse mouse = Mouse.current;
-        if (mouse == null)
-        {
-            return;
-        }
-
-        Vector2 mousePosition = mouse.position.ReadValue();
-        Camera eventCamera = GetEventCamera();
-        if (mouse.leftButton.wasPressedThisFrame && RectTransformUtility.RectangleContainsScreenPoint(_dragAreaRect, mousePosition, eventCamera))
-        {
-            _mouseAreaDragActive = true;
-            _mouseAreaDragHasBegun = false;
-            _lastMousePosition = mousePosition;
-            scroller_manager.NotifyPointerDown();
-            return;
-        }
-
-        if (_mouseAreaDragActive && mouse.leftButton.isPressed)
-        {
-            Vector2 currentMousePosition = mouse.position.ReadValue();
-            Vector2 deltaPointer = currentMousePosition - _lastMousePosition;
-            float deltaPixels = ScrollerAxisAdapter.GetPrimary(deltaPointer, GetActiveAxis());
-            _lastMousePosition = currentMousePosition;
-
-            if (Mathf.Abs(deltaPixels) > 0.01f)
+            Mouse mouse = Mouse.current;
+            if (mouse == null)
             {
-                if (!_mouseAreaDragHasBegun)
+                return;
+            }
+
+            Vector2 mousePosition = mouse.position.ReadValue();
+            Camera eventCamera = GetEventCamera();
+            if (mouse.leftButton.wasPressedThisFrame && RectTransformUtility.RectangleContainsScreenPoint(_dragAreaRect, mousePosition, eventCamera))
+            {
+                _mouseAreaDragActive = true;
+                _mouseAreaDragHasBegun = false;
+                _lastMousePosition = mousePosition;
+                scroller_manager.NotifyPointerDown();
+                return;
+            }
+
+            if (_mouseAreaDragActive && mouse.leftButton.isPressed)
+            {
+                Vector2 currentMousePosition = mouse.position.ReadValue();
+                Vector2 deltaPointer = currentMousePosition - _lastMousePosition;
+                float deltaPixels = ScrollerAxisAdapter.GetPrimary(deltaPointer, GetActiveAxis());
+                _lastMousePosition = currentMousePosition;
+
+                if (Mathf.Abs(deltaPixels) > 0.01f)
                 {
-                    _mouseAreaDragHasBegun = true;
-                    scroller_manager.BeginUserDrag();
+                    if (!_mouseAreaDragHasBegun)
+                    {
+                        _mouseAreaDragHasBegun = true;
+                        scroller_manager.BeginUserDrag();
+                    }
+
+                    float canvasScale = (_canvas != null && _canvas.scaleFactor > 0f) ? _canvas.scaleFactor : 1f;
+                    float direction = invert_drag_direction ? -1f : 1f;
+                    float deltaUnits = (deltaPixels / canvasScale) * drag_pixels_to_units * direction;
+                    float dt = Time.unscaledDeltaTime;
+                    scroller_manager.ApplyUserDragDelta(deltaUnits, dt);
+                }
+            }
+
+            if (_mouseAreaDragActive && mouse.leftButton.wasReleasedThisFrame)
+            {
+                if (_mouseAreaDragHasBegun)
+                {
+                    scroller_manager.EndUserDrag();
                 }
 
-                float canvasScale = (_canvas != null && _canvas.scaleFactor > 0f) ? _canvas.scaleFactor : 1f;
-                float direction = invert_drag_direction ? -1f : 1f;
-                float deltaUnits = (deltaPixels / canvasScale) * drag_pixels_to_units * direction;
-                float dt = Time.unscaledDeltaTime;
-                scroller_manager.ApplyUserDragDelta(deltaUnits, dt);
+                _mouseAreaDragActive = false;
+                _mouseAreaDragHasBegun = false;
             }
         }
-
-        if (_mouseAreaDragActive && mouse.leftButton.wasReleasedThisFrame)
-        {
-            if (_mouseAreaDragHasBegun)
-            {
-                scroller_manager.EndUserDrag();
-            }
-
-            _mouseAreaDragActive = false;
-            _mouseAreaDragHasBegun = false;
-        }
-    }
 
         private Camera GetEventCamera()
         {

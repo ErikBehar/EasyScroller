@@ -263,12 +263,13 @@ MonoBehaviour:
   single_prefab: {fileID: 3202979722558691739, guid: 217266f84efe99a409271c835d8b9a56, type: 3}
   single_prefab_count: 10
   scroll_axis: 1
-  list_mode: 0
+  list_mode: 1
   item_gap: 50
   buffer_item_count: 2
   fallback_visible_half_extent: 250
   inertia_damping: 8
   enable_snapping: 1
+  smooth_programmatic_scroll: 1
   snap_velocity_threshold: 2
   snap_smooth_time: 0.1
   snap_max_speed: 5000
@@ -290,9 +291,12 @@ MonoBehaviour:
   relayout_lerp_speed: 5
   relayout_settle_epsilon: 2
   relayout_winner_bias_force: 60
-  hide_items_until_initial_settle: 1
-  linked_scrollbar: {fileID: 0}
+  hide_items_until_initial_settle: 0
+  linked_scrollbar: {fileID: 803289955}
   invert_scrollbar_value: 0
+  scrollbar_scroll_smooth_time: 0.08
+  scrollbar_scroll_max_speed: 12000
+  scrollbar_jump_distance_threshold: 400
 --- !u!222 &119930689
 CanvasRenderer:
   m_ObjectHideFlags: 0
@@ -1418,19 +1422,7 @@ MonoBehaviour:
   m_NumberOfSteps: 0
   m_OnValueChanged:
     m_PersistentCalls:
-      m_Calls:
-      - m_Target: {fileID: 119930688}
-        m_TargetAssemblyTypeName: EasyScroller.ScrollerManager, EasyScrollerAssembly
-        m_MethodName: OnScrollbarValueChanged
-        m_Mode: 0
-        m_Arguments:
-          m_ObjectArgument: {fileID: 0}
-          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
-          m_IntArgument: 0
-          m_FloatArgument: 0
-          m_StringArgument: 
-          m_BoolArgument: 0
-        m_CallState: 2
+      m_Calls: []
 --- !u!114 &803289956
 MonoBehaviour:
   m_ObjectHideFlags: 0
