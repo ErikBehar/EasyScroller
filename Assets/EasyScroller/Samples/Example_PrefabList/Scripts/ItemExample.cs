@@ -12,11 +12,7 @@ public class ItemExample : MonoBehaviour
     {
         GetInfo();
         info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
-
-        if ( info.IsCentered)
-        {
-            onCenterEnter.Invoke();
-        }
+        OnCenterStateChanged(info.IsCentered);
     }
 
     public void OnCenterStateChanged(bool centered)

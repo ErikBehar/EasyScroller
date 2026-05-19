@@ -24,11 +24,7 @@ public class ItemExampleLoader : MonoBehaviour
         info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
         info.OnContentRefreshRequested.AddListener(RefreshContent);
         RefreshContent();
-
-        if (info.IsCentered)
-        {
-            onCenterEnter.Invoke();
-        }
+        OnCenterStateChanged(info.IsCentered);
     }
 
     public void OnCenterStateChanged(bool centered)
@@ -74,7 +70,7 @@ public class ItemExampleLoader : MonoBehaviour
             return;
         }
 
-        int index = Mathf.Clamp(info.OriginalIndex, 0, data.sprite_list.Count - 1);
+        int index = Mathf.Clamp(info.DataIndex, 0, data.sprite_list.Count - 1);
         image_holder.sprite = data.sprite_list[index];
     }
 }

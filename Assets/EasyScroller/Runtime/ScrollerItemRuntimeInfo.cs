@@ -7,8 +7,8 @@ namespace EasyScroller
     {
         [SerializeField, Tooltip("Logical item index used by ScrollerManager.")]
         private int logical_index;
-        [SerializeField, Tooltip("Original source index configured at initialization for this logical item.")]
-        private int original_index;
+        [SerializeField, Tooltip("Stable data index for this item's content (persists across enable/disable and pool reuse).")]
+        private int data_index;
         [SerializeField, Tooltip("Wrapper RectTransform for this pooled runtime item.")]
         private RectTransform wrapper_rect;
         [SerializeField, Tooltip("Content RectTransform (instantiated prefab root).")]
@@ -19,11 +19,14 @@ namespace EasyScroller
         private bool is_centered;
         [SerializeField, Tooltip("Invoked when centered state changes. Parameter is new centered state.")]
         private UnityEvent<bool> on_centered_state_changed = new UnityEvent<bool>();
-        [SerializeField, Tooltip("Invoked when this visual slot is rebound to a different logical/original item.")]
+        [SerializeField, Tooltip("Invoked when this visual slot is rebound to a different logical/data item.")]
         private UnityEvent on_content_refresh_requested = new UnityEvent();
 
         public int LogicalIndex => logical_index;
-        public int OriginalIndex => original_index;
+        /// <summary>Stable index into your data source; does not change when the runtime list is reordered.</summary>
+        public int DataIndex => data_index;
+        /// <summary>Alias for <see cref="DataIndex"/>.</summary>
+        public int OriginalIndex => data_index;
         public RectTransform WrapperRect => wrapper_rect;
         public RectTransform ContentRect => content_rect;
         public ScrollerManager Manager => manager;
@@ -31,10 +34,10 @@ namespace EasyScroller
         public UnityEvent<bool> OnCenteredStateChanged => on_centered_state_changed;
         public UnityEvent OnContentRefreshRequested => on_content_refresh_requested;
 
-        public void Initialize(int logicalIndex, int originalIndex, RectTransform wrapperRect, RectTransform contentRect)
+        public void Initialize(int logicalIndex, int dataIndex, RectTransform wrapperRect, RectTransform contentRect)
         {
             logical_index = logicalIndex;
-            original_index = originalIndex;
+            data_index = dataIndex;
             wrapper_rect = wrapperRect;
             content_rect = contentRect;
         }
@@ -60,9 +63,14 @@ namespace EasyScroller
             logical_index = logicalIndex;
         }
 
-        public void SetOriginalIndex(int originalIndex)
+        public void SetDataIndex(int dataIndex)
         {
-            original_index = originalIndex;
+            data_index = dataIndex;
+        }
+
+        public void SetOriginalIndex(int dataIndex)
+        {
+            SetDataIndex(dataIndex);
         }
 
         public void SetManager(ScrollerManager scrollerManager)

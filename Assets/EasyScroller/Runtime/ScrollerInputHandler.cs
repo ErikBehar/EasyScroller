@@ -66,16 +66,6 @@ namespace EasyScroller
             StartSpin(-1, speedUnitsPerSecond, durationSeconds);
         }
 
-        public void StartSpinUp(float speedUnitsPerSecond, float durationSeconds)
-        {
-            StartSpinPositive(speedUnitsPerSecond, durationSeconds);
-        }
-
-        public void StartSpinDown(float speedUnitsPerSecond, float durationSeconds)
-        {
-            StartSpinNegative(speedUnitsPerSecond, durationSeconds);
-        }
-
         public void StopSpin()
         {
             if (_spinRoutine != null)

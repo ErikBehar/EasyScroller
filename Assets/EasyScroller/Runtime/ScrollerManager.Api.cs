@@ -31,7 +31,7 @@ namespace EasyScroller
             DestroyAllVisualsAndClearPools();
             BuildItemState();
             _pendingInitialReveal = hide_items_until_initial_settle;
-            ApplyStructureChangeAndRefreshVisuals();
+            ApplyStructureChangeAndRefreshVisuals(false);
         }
 
         /// <summary>
@@ -258,8 +258,8 @@ namespace EasyScroller
                 return false;
             }
 
-            int nextOriginalIndex = GetNextOriginalItemIndex();
-            _items.Add(new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextOriginalIndex));
+            int nextDataIndex = GetNextDataIndex();
+            _items.Add(new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex));
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -269,7 +269,7 @@ namespace EasyScroller
         /// </summary>
         /// <param name="itemIndex">Runtime/logical item index to disable.</param>
         /// <returns>True if the item was disabled; otherwise false.</returns>
-        public bool RemoveItemAtRuntime(int itemIndex)
+        public bool RemoveItemAtRuntime(int itemIndex, ScrollerItemRuntimeInfo requester = null)
         {
             if (itemIndex < 0 || itemIndex >= _items.Count)
             {
@@ -282,7 +282,7 @@ namespace EasyScroller
             }
 
             _items[itemIndex].Enabled = false;
-            PurgeVisualsForLogicalIndex(itemIndex);
+            PurgeVisualsForLogicalIndex(itemIndex, requester);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -330,7 +330,7 @@ namespace EasyScroller
                 return false;
             }
 
-            return RemoveItemAtRuntime(runtimeInfo.LogicalIndex);
+            return RemoveItemAtRuntime(runtimeInfo.LogicalIndex, runtimeInfo);
         }
 
         /// <summary>
@@ -354,8 +354,8 @@ namespace EasyScroller
             }
 
             int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
-            int nextOriginalIndex = GetNextOriginalItemIndex();
-            ItemState newItem = new ItemState(prefab, ResolvePrefabPrimarySize(prefab), clampedIndex, nextOriginalIndex);
+            int nextDataIndex = GetNextDataIndex();
+            ItemState newItem = new ItemState(prefab, ResolvePrefabPrimarySize(prefab), clampedIndex, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
             prefab_list.Insert(clampedIndex, prefab);
             ReindexSourcePrefabIndices();
@@ -384,8 +384,8 @@ namespace EasyScroller
             }
 
             int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
-            int nextOriginalIndex = GetNextOriginalItemIndex();
-            ItemState newItem = new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextOriginalIndex);
+            int nextDataIndex = GetNextDataIndex();
+            ItemState newItem = new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
             DestroyAllVisualsAndClearPools();
             ApplyStructureChangeAndRefreshVisuals();
@@ -486,7 +486,7 @@ namespace EasyScroller
             int logicalIndex = -1;
             for (int i = 0; i < _items.Count; i++)
             {
-                if (_items[i].OriginalItemIndex == originalIndex && _items[i].Enabled)
+                if (_items[i].DataIndex == originalIndex && _items[i].Enabled)
                 {
                     logicalIndex = i;
                     break;
@@ -518,105 +518,41 @@ namespace EasyScroller
         }
 
         /// <summary>
-        /// Steps scrolling by a signed number of item positions.
-        /// Positive values move in the configured positive axis direction.
+        /// Centers the next item along the configured positive primary axis (chain successor).
         /// </summary>
-        /// <param name="direction">Positive or negative direction sign.</param>
-        /// <param name="steps">Number of item steps to move.</param>
-        /// <returns>True if movement was accepted; otherwise false.</returns>
-        public bool MoveScrollerByDirection(int direction, int steps = 1)
+        /// <param name="steps">How many items to advance.</param>
+        /// <returns>True if centering was started; otherwise false.</returns>
+        public bool CenterNextItem(int steps = 1)
         {
-            if (_enabledIndices.Count == 0 || direction == 0 || steps <= 0)
-            {
-                return false;
-            }
-
-            int sign = direction > 0 ? 1 : -1;
-            int baseOrder = GetReferenceOrderForProgrammaticNavigation();
-
-            int targetOrder = baseOrder + (sign * steps);
-            targetOrder = ClampOrderForMode(targetOrder);
-            float targetOffset = GetOrderCenterPosition(targetOrder);
-            targetOffset = ClampOffsetForMode(targetOffset);
-            _programmaticStepOrder = targetOrder;
-            _hasProgrammaticStepAnchor = true;
-
-            _scrollVelocity = 0f;
-            _snapVelocity = 0f;
-
-            if (enable_snapping)
-            {
-                _snapTargetOrder = targetOrder;
-                _snapTargetOffset = targetOffset;
-                _hasSnapTarget = true;
-                _snapTargetLockedUntilUserInput = true;
-            }
-            else
-            {
-                _scrollOffset = targetOffset;
-                _hasSettledOrder = true;
-                _settledOrder = targetOrder;
-            }
-
-            return true;
+            return CenterAdjacentChainItem(1, steps);
         }
 
         /// <summary>
-        /// Axis-neutral helper that moves in the configured positive direction.
+        /// Centers the previous item along the configured negative primary axis (chain predecessor).
         /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        /// <returns>True if movement was accepted; otherwise false.</returns>
-        public bool MovePositiveDirection(int steps = 1)
+        /// <param name="steps">How many items to move back.</param>
+        /// <returns>True if centering was started; otherwise false.</returns>
+        public bool CenterPreviousItem(int steps = 1)
         {
-            return MoveScrollerByDirection(1, steps);
+            return CenterAdjacentChainItem(-1, steps);
         }
 
         /// <summary>
-        /// Axis-neutral helper that moves in the configured negative direction.
+        /// UnityEvent-friendly wrapper for <see cref="CenterNextItem(int)"/>.
         /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        /// <returns>True if movement was accepted; otherwise false.</returns>
-        public bool MoveNegativeDirection(int steps = 1)
+        /// <param name="steps">How many items to advance.</param>
+        public void CenterNextItemNoRet(int steps = 1)
         {
-            return MoveScrollerByDirection(-1, steps);
+            CenterNextItem(steps);
         }
 
         /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="MoveUp(int)"/>.
+        /// UnityEvent-friendly wrapper for <see cref="CenterPreviousItem(int)"/>.
         /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        public void MoveUpNoRet(int steps = 1)
+        /// <param name="steps">How many items to move back.</param>
+        public void CenterPreviousItemNoRet(int steps = 1)
         {
-            MoveUp(steps);
-        }
-
-        /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="MoveDown(int)"/>.
-        /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        public void MoveDownNoRet(int steps = 1)
-        {
-            MoveDown(steps);
-        }
-
-        /// <summary>
-        /// Moves in the configured positive axis direction.
-        /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        /// <returns>True if movement was accepted; otherwise false.</returns>
-        public bool MoveUp(int steps = 1)
-        {
-            return MovePositiveDirection(steps);
-        }
-
-        /// <summary>
-        /// Moves in the configured negative axis direction.
-        /// </summary>
-        /// <param name="steps">Number of item steps to move.</param>
-        /// <returns>True if movement was accepted; otherwise false.</returns>
-        public bool MoveDown(int steps = 1)
-        {
-            return MoveNegativeDirection(steps);
+            CenterPreviousItem(steps);
         }
 
         /// <summary>
@@ -638,6 +574,7 @@ namespace EasyScroller
             _snapVelocity = 0f;
             _hasSnapTarget = false;
             _snapTargetLockedUntilUserInput = false;
+            _snapTargetChainVisual = null;
             _hasProgrammaticStepAnchor = false;
         }
 
