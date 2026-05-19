@@ -51,19 +51,7 @@ namespace EasyScroller
                 return;
             }
 
-            if (!IsFiniteMode())
-            {
-                // Standard 0..1 scrollbar semantics only apply to bounded finite mode.
-                return;
-            }
-
-            float effectiveValue = Mathf.Clamp01(normalizedValue);
-            if (invert_scrollbar_value)
-            {
-                effectiveValue = 1f - effectiveValue;
-            }
-
-            ApplyLinkedScrollbarNormalizedValue(effectiveValue);
+            ApplyLinkedScrollbarNormalizedValue(EffectiveScrollbarValue(normalizedValue));
         }
 
         /// <summary>
@@ -226,6 +214,7 @@ namespace EasyScroller
             int sourcePrefabIndex = prefab_list.Count;
             prefab_list.Add(prefab);
             _items.Add(new ItemState(prefab, ResolvePrefabPrimarySize(prefab), sourcePrefabIndex, sourcePrefabIndex));
+            _pendingSpliceLogicalIndex = _items.Count - 1;
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -250,6 +239,7 @@ namespace EasyScroller
 
             int nextDataIndex = GetNextDataIndex();
             _items.Add(new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex));
+            _pendingSpliceLogicalIndex = _items.Count - 1;
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -327,7 +317,7 @@ namespace EasyScroller
         /// Inserts an item at the requested index in prefab-list mode.
         /// Delegates to single-prefab insert when that source mode is active.
         /// </summary>
-        /// <param name="itemIndex">Target insert index (clamped to valid range).</param>
+        /// <param name="itemIndex">Target insert position among enabled items (0 = first; pass enabled count to append).</param>
         /// <param name="prefab">Prefab to insert in prefab-list mode.</param>
         /// <returns>True if the insert succeeds; otherwise false.</returns>
         public bool InsertItemAtRuntime(int itemIndex, GameObject prefab)
@@ -343,13 +333,24 @@ namespace EasyScroller
                 return false;
             }
 
-            int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
+            RefreshEnabledIndices();
+            int enabledSlot = Mathf.Clamp(itemIndex, 0, _enabledIndices.Count);
+            int clampedIndex = ResolveLogicalIndexForEnabledInsertSlot(enabledSlot);
             int nextDataIndex = GetNextDataIndex();
+            if (!smooth_relayout_on_structure_change)
+            {
+                DestroyAllVisualsAndClearPools();
+            }
+
             ItemState newItem = new ItemState(prefab, ResolvePrefabPrimarySize(prefab), clampedIndex, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
             prefab_list.Insert(clampedIndex, prefab);
+            if (smooth_relayout_on_structure_change)
+            {
+                ShiftChainLogicalIndicesFrom(clampedIndex, 1);
+            }
             ReindexSourcePrefabIndices();
-            DestroyAllVisualsAndClearPools();
+            _pendingSpliceLogicalIndex = clampedIndex;
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -357,7 +358,7 @@ namespace EasyScroller
         /// <summary>
         /// Inserts a new single-prefab item at the requested index.
         /// </summary>
-        /// <param name="itemIndex">Target insert index (clamped to valid range).</param>
+        /// <param name="itemIndex">Target insert position among enabled items (0 = first; pass enabled count to append).</param>
         /// <returns>True if the insert succeeds; otherwise false.</returns>
         public bool InsertItemAtRuntime(int itemIndex)
         {
@@ -373,11 +374,22 @@ namespace EasyScroller
                 return false;
             }
 
-            int clampedIndex = Mathf.Clamp(itemIndex, 0, _items.Count);
+            RefreshEnabledIndices();
+            int enabledSlot = Mathf.Clamp(itemIndex, 0, _enabledIndices.Count);
+            int clampedIndex = ResolveLogicalIndexForEnabledInsertSlot(enabledSlot);
             int nextDataIndex = GetNextDataIndex();
+            if (!smooth_relayout_on_structure_change)
+            {
+                DestroyAllVisualsAndClearPools();
+            }
+
             ItemState newItem = new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
-            DestroyAllVisualsAndClearPools();
+            if (smooth_relayout_on_structure_change)
+            {
+                ShiftChainLogicalIndicesFrom(clampedIndex, 1);
+            }
+            _pendingSpliceLogicalIndex = clampedIndex;
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -550,10 +562,10 @@ namespace EasyScroller
         /// </summary>
         public void BeginUserDrag()
         {
+            EndRelayout();
             _isDragging = true;
             _scrollVelocity = 0f;
-            ClearActiveSnapState();
-            _hasProgrammaticStepAnchor = false;
+            InterruptPassiveSnapForScrollDrive();
         }
 
         /// <summary>

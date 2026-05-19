@@ -2,7 +2,8 @@
     "name": "EasyScroller_Samples",
     "rootNamespace": "",
     "references": [
-        "GUID:05a948285a475524aa7d67f12835fa79"
+        "GUID:05a948285a475524aa7d67f12835fa79",
+        "GUID:6055be8ebefd69e48b49212b09b47b2f"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
