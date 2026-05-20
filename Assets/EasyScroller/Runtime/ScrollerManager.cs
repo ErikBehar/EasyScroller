@@ -970,12 +970,20 @@ namespace EasyScroller
             }
             else
             {
-                _scrollOffset = ClampOffsetForMode(targetOffset);
-                ClearActiveSnapState();
-                _hasSettledOrder = true;
-                _settledOrder = _programmaticStepOrder;
-                _settledChainVisual = FindChainVisualByOrder(_programmaticStepOrder);
-                ApplyScrollOffsetToChainImmediately();
+                VisualItem targetVisual = FindChainVisualByOrder(_programmaticStepOrder);
+                if (IsVisualActiveInChain(targetVisual))
+                {
+                    SettleScrollAtVisual(targetVisual);
+                }
+                else
+                {
+                    _scrollOffset = ClampOffsetForMode(targetOffset);
+                    ClearActiveSnapState();
+                    _hasSettledOrder = true;
+                    _settledOrder = _programmaticStepOrder;
+                    _settledChainVisual = null;
+                    ApplyScrollOffsetToChainImmediately();
+                }
             }
 
             SyncVisibleWindow();
@@ -1071,6 +1079,7 @@ namespace EasyScroller
             //    logicals, drop everything past a non-sequential break, then
             //    refresh AbsoluteOrderIndex values relative to the chain head.
             ReconcileChainLogicalsAndOrders();
+            SyncNavigationAnchorsAfterChainReconcile();
 
             if (_chainHead == null)
             {
@@ -1339,19 +1348,43 @@ namespace EasyScroller
                 return;
             }
 
-            // 3) Reassign AbsoluteOrderIndex values starting from chain head.
-            //    The head's order is chosen so its lattice position is close to
-            //    _scrollOffset, keeping the scroll metric meaningful for snap
-            //    targets and scrollbar normalization.
-            int headOrder = ComputeNearestOrderForLogical(_chainHead.LogicalIndex, _scrollOffset);
-            _chainHead.AbsoluteOrderIndex = headOrder;
-            VisualItem cursor = _chainHead.Next;
-            int orderValue = headOrder;
-            while (cursor != null)
+            // 3) Reassign AbsoluteOrderIndex on each chain visual.
+            if (IsFiniteMode())
             {
-                orderValue++;
-                cursor.AbsoluteOrderIndex = orderValue;
-                cursor = cursor.Next;
+                // Finite: order is the enabled slot (0..count-1). ScrollToLogicalIndex,
+                // snap, and lattice math all key off that slot — not a running index from
+                // the head, which would drift after add/remove (e.g. orders 2,3,4,5 for
+                // four items) and break lookup by order.
+                v = _chainHead;
+                while (v != null)
+                {
+                    int slot = GetEnabledSlot(v.LogicalIndex);
+                    if (slot >= 0)
+                    {
+                        v.AbsoluteOrderIndex = slot;
+                    }
+                    v = v.Next;
+                }
+
+                if (!_relayoutActive)
+                {
+                    AlignFiniteChainVisualAxesToLattice();
+                }
+            }
+            else
+            {
+                // Infinite: head order tracks scroll offset on the wrapped lattice;
+                // successors use consecutive lattice indices (same logical may repeat).
+                int headOrder = ComputeNearestOrderForLogical(_chainHead.LogicalIndex, _scrollOffset);
+                _chainHead.AbsoluteOrderIndex = headOrder;
+                VisualItem cursor = _chainHead.Next;
+                int orderValue = headOrder;
+                while (cursor != null)
+                {
+                    orderValue++;
+                    cursor.AbsoluteOrderIndex = orderValue;
+                    cursor = cursor.Next;
+                }
             }
         }
 
@@ -1363,6 +1396,68 @@ namespace EasyScroller
                 return slotB == slotA + 1;
             }
             return slotB == Mod(slotA + 1, count);
+        }
+
+        /// <summary>
+        /// Places finite chain visuals on the rebuilt lattice for the current
+        /// <see cref="_scrollOffset"/> so scroll-to-index targets the correct item
+        /// after deletes (not pre-delete screen positions).
+        /// </summary>
+        private void AlignFiniteChainVisualAxesToLattice()
+        {
+            if (!IsFiniteMode() || _chainHead == null)
+            {
+                return;
+            }
+
+            VisualItem v = _chainHead;
+            while (v != null)
+            {
+                int slot = GetEnabledSlot(v.LogicalIndex);
+                if (slot >= 0)
+                {
+                    float axis = GetOrderCenterPosition(slot) - _scrollOffset;
+                    SetVisualAxis(v, axis);
+                }
+
+                v = v.Next;
+            }
+        }
+
+        /// <summary>
+        /// Keeps snap / step anchors aligned with post-reconcile enabled slots.
+        /// </summary>
+        private void SyncNavigationAnchorsAfterChainReconcile()
+        {
+            if (_hasSettledOrder && IsVisualActiveInChain(_settledChainVisual))
+            {
+                if (!IsLogicalEnabled(_settledChainVisual.LogicalIndex))
+                {
+                    _hasSettledOrder = false;
+                    _settledChainVisual = null;
+                }
+                else if (IsFiniteMode())
+                {
+                    int slot = GetEnabledSlot(_settledChainVisual.LogicalIndex);
+                    if (slot >= 0)
+                    {
+                        _settledOrder = slot;
+                    }
+                }
+                else
+                {
+                    _settledOrder = _settledChainVisual.AbsoluteOrderIndex;
+                }
+            }
+
+            if (_hasProgrammaticStepAnchor && IsFiniteMode())
+            {
+                int logical = ResolveLogicalIndexFromOrder(_programmaticStepOrder);
+                if (logical < 0 || !IsLogicalEnabled(logical))
+                {
+                    _hasProgrammaticStepAnchor = false;
+                }
+            }
         }
 
         private bool IsVisualActiveInChain(VisualItem visual)
@@ -1949,9 +2044,12 @@ namespace EasyScroller
                     return;
                 }
 
-                if (FindChainVisualByLogicalIndex(nextLogical) != null)
+                // Infinite mode may need several chain nodes for the same logical
+                // (e.g. A,B,C,D,A,B,...) when enabled count < visible slots.
+                // Uniqueness is per absolute order, not per logical index.
+                if (FindChainVisualByOrder(nextOrder) != null)
                 {
-                    continue;
+                    return;
                 }
 
                 float edgeAxis = GetVisualAxis(edge);
@@ -2915,18 +3013,13 @@ namespace EasyScroller
                 _snapTargetOffset = GetOrderCenterPosition(_snapTargetOrder);
             }
 
-            if (_hasSettledOrder)
-            {
-                _settledOrder = ClampOrderForMode(_settledOrder);
-                int settledLogical = ResolveLogicalIndexFromOrder(_settledOrder);
-                if (settledLogical < 0 || settledLogical >= _items.Count || !_items[settledLogical].Enabled)
-                {
-                    _hasSettledOrder = false;
-                    _settledChainVisual = null;
-                }
-            }
-
             if (_hasSettledOrder && !IsVisualActiveInChain(_settledChainVisual))
+            {
+                _hasSettledOrder = false;
+                _settledChainVisual = null;
+            }
+            else if (_hasSettledOrder && IsVisualActiveInChain(_settledChainVisual) &&
+                     !IsLogicalEnabled(_settledChainVisual.LogicalIndex))
             {
                 _hasSettledOrder = false;
                 _settledChainVisual = null;

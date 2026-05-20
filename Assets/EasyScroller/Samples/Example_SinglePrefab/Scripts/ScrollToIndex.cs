@@ -9,6 +9,6 @@ public class ScrollToIndex : MonoBehaviour
 
     public void DoScrollToIndex()
     {
-        scroll_manager.ScrollToLogicalIndex(int.Parse(input_field.text));
+        scroll_manager.ScrollToVisibleSlot(int.Parse(input_field.text));
     }
 }

@@ -176,6 +176,42 @@ namespace EasyScroller
         }
 
         /// <summary>
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToVisibleSlot(int, bool)"/> (animated).
+        /// </summary>
+        /// <param name="visibleSlot">0-based position among currently enabled items.</param>
+        public void ScrollToVisibleSlotNoRet(int visibleSlot)
+        {
+            ScrollToVisibleSlot(visibleSlot);
+        }
+
+        /// <summary>
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToVisibleSlot(int, bool)"/> (instant).
+        /// </summary>
+        /// <param name="visibleSlot">0-based position among currently enabled items.</param>
+        public void JumpToVisibleSlotNoRet(int visibleSlot)
+        {
+            ScrollToVisibleSlot(visibleSlot, false);
+        }
+
+        /// <summary>
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToNearestVisibleSlot(int, bool)"/> (animated).
+        /// </summary>
+        /// <param name="dataIndex">Stable data index to locate.</param>
+        public void ScrollToNearestVisibleSlotNoRet(int dataIndex)
+        {
+            ScrollToNearestVisibleSlot(dataIndex);
+        }
+
+        /// <summary>
+        /// UnityEvent-friendly wrapper for <see cref="ScrollToNearestVisibleSlot(int, bool)"/> (instant).
+        /// </summary>
+        /// <param name="dataIndex">Stable data index to locate.</param>
+        public void JumpToNearestVisibleSlotNoRet(int dataIndex)
+        {
+            ScrollToNearestVisibleSlot(dataIndex, false);
+        }
+
+        /// <summary>
         /// UnityEvent-friendly wrapper for <see cref="ScrollToRuntimeInfo(ScrollerItemRuntimeInfo, bool)"/> (animated).
         /// </summary>
         /// <param name="runtimeInfo">Runtime item info to resolve target index from.</param>
@@ -492,6 +528,43 @@ namespace EasyScroller
             }
 
             return ScrollToLogicalIndex(logicalIndex, animated);
+        }
+
+        /// <summary>
+        /// Scrolls to the Nth currently enabled item in visible order
+        /// (0 = first visible, <c>enabledCount - 1</c> = last).
+        /// Use this in finite mode when the UI numbers items after deletes;
+        /// <see cref="ScrollToLogicalIndex(int, bool)"/> addresses the underlying
+        /// logical index in <see cref="_items"/> (which can have gaps when items
+        /// are soft-removed).
+        /// In infinite mode the same enabled slot is used at the nearest wrap
+        /// cycle relative to the current scroll position.
+        /// </summary>
+        /// <param name="visibleSlot">0-based index among enabled items only.</param>
+        /// <param name="animated">True to animate via snap; false to jump instantly.</param>
+        /// <returns>True if the slot is in range and scrolling was applied; otherwise false.</returns>
+        public bool ScrollToVisibleSlot(int visibleSlot, bool animated = true)
+        {
+            if (visibleSlot < 0 || visibleSlot >= _enabledIndices.Count)
+            {
+                return false;
+            }
+
+            return ScrollToLogicalIndex(_enabledIndices[visibleSlot], animated);
+        }
+
+        /// <summary>
+        /// Scrolls to the enabled item with the given stable data index.
+        /// In infinite mode this selects the nearest wrap copy on the lattice
+        /// (same implementation as <see cref="ScrollToDataIndex(int, bool)"/>).
+        /// In finite mode there is only one copy.
+        /// </summary>
+        /// <param name="dataIndex">Stable data index assigned at item creation.</param>
+        /// <param name="animated">True to animate via snap; false to jump instantly.</param>
+        /// <returns>True if a matching enabled item exists; otherwise false.</returns>
+        public bool ScrollToNearestVisibleSlot(int dataIndex, bool animated = true)
+        {
+            return ScrollToDataIndex(dataIndex, animated);
         }
 
         /// <summary>
