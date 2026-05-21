@@ -10,7 +10,11 @@ public class ItemExample : MonoBehaviour
 
     private void Start()
     {
-        GetInfo();
+        if (!TryBindInfo())
+        {
+            return;
+        }
+
         info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
         OnCenterStateChanged(info.IsCentered);
     }
@@ -29,7 +33,11 @@ public class ItemExample : MonoBehaviour
 
     public void DeleteSelf()
     {
-        GetInfo();
+        if (!TryBindInfo())
+        {
+            return;
+        }
+
         info.RequestRemoveSelf();
     }
 
@@ -41,11 +49,25 @@ public class ItemExample : MonoBehaviour
         }
     }
 
-    private void GetInfo()
+    private bool TryBindInfo()
     {
-        if (info == null)
+        if (info != null)
         {
-            info = transform.parent.GetComponent<ScrollerItemRuntimeInfo>();
+            return true;
         }
+
+        Transform current = transform.parent;
+        while (current != null)
+        {
+            info = current.GetComponent<ScrollerItemRuntimeInfo>();
+            if (info != null)
+            {
+                return true;
+            }
+
+            current = current.parent;
+        }
+
+        return false;
     }
 }

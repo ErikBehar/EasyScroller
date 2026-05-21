@@ -173,6 +173,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: EasyScroller_Samples::AddItemIndex
   input_field: {fileID: 977391018}
   scroll_manager: {fileID: 119930688}
+  prefab: {fileID: 0}
 --- !u!114 &952011
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -401,7 +402,7 @@ MonoBehaviour:
   single_prefab: {fileID: 3202979722558691739, guid: 217266f84efe99a409271c835d8b9a56, type: 3}
   single_prefab_count: 10
   scroll_axis: 1
-  list_mode: 1
+  list_mode: 0
   item_gap: 50
   buffer_item_count: 2
   fallback_visible_half_extent: 250

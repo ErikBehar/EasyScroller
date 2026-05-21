@@ -30,6 +30,7 @@ namespace EasyScroller
 
             DestroyAllVisualsAndClearPools();
             BuildItemState();
+            MarkPendingRebuildMutation();
             _pendingInitialReveal = hide_items_until_initial_settle;
             ApplyStructureChangeAndRefreshVisuals(false);
         }
@@ -72,6 +73,14 @@ namespace EasyScroller
             }
 
             _items[itemIndex].Enabled = enabled;
+            if (enabled)
+            {
+                MarkPendingInsertMutation(itemIndex);
+            }
+            else
+            {
+                MarkPendingRemoveMutation(itemIndex);
+            }
             ApplyStructureChangeAndRefreshVisuals();
         }
 
@@ -250,7 +259,7 @@ namespace EasyScroller
             int sourcePrefabIndex = prefab_list.Count;
             prefab_list.Add(prefab);
             _items.Add(new ItemState(prefab, ResolvePrefabPrimarySize(prefab), sourcePrefabIndex, sourcePrefabIndex));
-            _pendingSpliceLogicalIndex = _items.Count - 1;
+            MarkPendingInsertMutation(_items.Count - 1);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -275,7 +284,7 @@ namespace EasyScroller
 
             int nextDataIndex = GetNextDataIndex();
             _items.Add(new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex));
-            _pendingSpliceLogicalIndex = _items.Count - 1;
+            MarkPendingInsertMutation(_items.Count - 1);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -299,6 +308,7 @@ namespace EasyScroller
 
             _items[itemIndex].Enabled = false;
             PurgeVisualsForLogicalIndex(itemIndex, requester);
+            MarkPendingRemoveMutation(itemIndex);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -373,10 +383,6 @@ namespace EasyScroller
             int enabledSlot = Mathf.Clamp(itemIndex, 0, _enabledIndices.Count);
             int clampedIndex = ResolveLogicalIndexForEnabledInsertSlot(enabledSlot);
             int nextDataIndex = GetNextDataIndex();
-            if (!smooth_relayout_on_structure_change)
-            {
-                DestroyAllVisualsAndClearPools();
-            }
 
             ItemState newItem = new ItemState(prefab, ResolvePrefabPrimarySize(prefab), clampedIndex, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
@@ -386,7 +392,7 @@ namespace EasyScroller
                 ShiftChainLogicalIndicesFrom(clampedIndex, 1);
             }
             ReindexSourcePrefabIndices();
-            _pendingSpliceLogicalIndex = clampedIndex;
+            MarkPendingInsertMutation(clampedIndex);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -414,10 +420,6 @@ namespace EasyScroller
             int enabledSlot = Mathf.Clamp(itemIndex, 0, _enabledIndices.Count);
             int clampedIndex = ResolveLogicalIndexForEnabledInsertSlot(enabledSlot);
             int nextDataIndex = GetNextDataIndex();
-            if (!smooth_relayout_on_structure_change)
-            {
-                DestroyAllVisualsAndClearPools();
-            }
 
             ItemState newItem = new ItemState(single_prefab, ResolvePrefabPrimarySize(single_prefab), -1, nextDataIndex);
             _items.Insert(clampedIndex, newItem);
@@ -425,7 +427,7 @@ namespace EasyScroller
             {
                 ShiftChainLogicalIndicesFrom(clampedIndex, 1);
             }
-            _pendingSpliceLogicalIndex = clampedIndex;
+            MarkPendingInsertMutation(clampedIndex);
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -442,8 +444,12 @@ namespace EasyScroller
                 return false;
             }
 
+            MarkPendingRemoveMutation(itemIndex);
+            PurgeVisualsForLogicalIndex(itemIndex);
+
             ItemState removedItem = _items[itemIndex];
             _items.RemoveAt(itemIndex);
+            ShiftChainLogicalIndicesFrom(itemIndex + 1, -1);
 
             if (item_source_mode == ScrollerItemSourceMode.PrefabList)
             {
@@ -455,7 +461,6 @@ namespace EasyScroller
                 ReindexSourcePrefabIndices();
             }
 
-            DestroyAllVisualsAndClearPools();
             ApplyStructureChangeAndRefreshVisuals();
             return true;
         }
@@ -490,6 +495,7 @@ namespace EasyScroller
                 ReindexSourcePrefabIndices();
             }
 
+            MarkPendingReorderMutation(fromIndex, toIndex);
             DestroyAllVisualsAndClearPools();
             ApplyStructureChangeAndRefreshVisuals();
             return true;
@@ -510,7 +516,7 @@ namespace EasyScroller
 
             int targetOrder = GetTargetOrderForLogicalIndex(logicalIndex);
             float targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
-            return ScrollToOffsetAndOrder(targetOffset, targetOrder, animated);
+            return ScrollToOffsetAndOrder(targetOffset, targetOrder, logicalIndex, animated);
         }
 
         /// <summary>

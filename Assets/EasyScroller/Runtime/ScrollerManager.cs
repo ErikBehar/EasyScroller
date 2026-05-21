@@ -151,6 +151,16 @@ namespace EasyScroller
             public bool IsInChain;
             public VisualItem Prev;
             public VisualItem Next;
+            public GameObject BoundContentPrefab;
+        }
+
+        private enum MutationKind
+        {
+            None,
+            Insert,
+            Remove,
+            Reorder,
+            Rebuild
         }
 
         private readonly List<ItemState> _items = new List<ItemState>();
@@ -195,9 +205,15 @@ namespace EasyScroller
         private float _scrollbarScrollVelocity;
         private bool _scrollbarOffsetLeadsChain;
         private bool _scrollbarPointerHeld;
-        private int _pendingSpliceLogicalIndex = -1;
+        private MutationKind _pendingMutationKind = MutationKind.None;
+        private int _pendingMutationLogicalIndex = -1;
+        private int _pendingMutationFromLogicalIndex = -1;
+        private int _pendingMutationToLogicalIndex = -1;
         private float _lastScrollOffsetForChainMotion;
         private bool _skipCollectiveScrollThisFrame;
+        private readonly List<int> _viewportOrdersScratch = new List<int>();
+        private bool _validateChainThisFrame;
+        private bool _deferChainTrim;
         private float _frameVisibleHalfExtent;
         private bool _frameVisibleHalfExtentValid;
         private readonly List<ScrollerItemRuntimeInfo> _pendingContentRefreshes = new List<ScrollerItemRuntimeInfo>();
@@ -281,6 +297,15 @@ namespace EasyScroller
             // Spring toward an active snap target (programmatic next/prev or auto-snap).
             if (_hasSnapTarget && !_isDragging && Mathf.Abs(_scrollVelocity) < snap_velocity_threshold)
             {
+                if (!IsVisualActiveInChain(_snapTargetChainVisual))
+                {
+                    VisualItem resolvedTarget = FindChainVisualByOrder(_snapTargetOrder);
+                    if (IsVisualActiveInChain(resolvedTarget))
+                    {
+                        _snapTargetChainVisual = resolvedTarget;
+                    }
+                }
+
                 if (IsVisualActiveInChain(_snapTargetChainVisual))
                 {
                     _snapTargetOrder = _snapTargetChainVisual.AbsoluteOrderIndex;
@@ -315,7 +340,8 @@ namespace EasyScroller
                 !_hasSnapTarget &&
                 !_isDragging &&
                 !_scrollbarOffsetLeadsChain &&
-                Mathf.Abs(_scrollVelocity) < snap_velocity_threshold)
+                Mathf.Abs(_scrollVelocity) < snap_velocity_threshold &&
+                !IsIdleOnSettledSnapVisual())
             {
                 BeginSnapToResolvedTargetVisual();
             }
@@ -496,6 +522,51 @@ namespace EasyScroller
             }
         }
 
+        private void MarkPendingInsertMutation(int logicalIndex)
+        {
+            _pendingMutationKind = MutationKind.Insert;
+            _pendingMutationLogicalIndex = logicalIndex;
+            _pendingMutationFromLogicalIndex = -1;
+            _pendingMutationToLogicalIndex = -1;
+        }
+
+        private void MarkPendingRemoveMutation(int logicalIndex)
+        {
+            _pendingMutationKind = MutationKind.Remove;
+            _pendingMutationLogicalIndex = logicalIndex;
+            _pendingMutationFromLogicalIndex = logicalIndex;
+            _pendingMutationToLogicalIndex = -1;
+        }
+
+        private void MarkPendingReorderMutation(int fromLogicalIndex, int toLogicalIndex)
+        {
+            _pendingMutationKind = MutationKind.Reorder;
+            _pendingMutationLogicalIndex = -1;
+            _pendingMutationFromLogicalIndex = fromLogicalIndex;
+            _pendingMutationToLogicalIndex = toLogicalIndex;
+        }
+
+        private void MarkPendingRebuildMutation()
+        {
+            _pendingMutationKind = MutationKind.Rebuild;
+            _pendingMutationLogicalIndex = -1;
+            _pendingMutationFromLogicalIndex = -1;
+            _pendingMutationToLogicalIndex = -1;
+        }
+
+        private void ConsumePendingMutation(out MutationKind kind, out int logicalIndex, out int fromLogicalIndex, out int toLogicalIndex)
+        {
+            kind = _pendingMutationKind;
+            logicalIndex = _pendingMutationLogicalIndex;
+            fromLogicalIndex = _pendingMutationFromLogicalIndex;
+            toLogicalIndex = _pendingMutationToLogicalIndex;
+
+            _pendingMutationKind = MutationKind.None;
+            _pendingMutationLogicalIndex = -1;
+            _pendingMutationFromLogicalIndex = -1;
+            _pendingMutationToLogicalIndex = -1;
+        }
+
         private void RebuildEnabledSpacingData()
         {
             _enabledPrefixPositions.Clear();
@@ -672,24 +743,13 @@ namespace EasyScroller
 
         private int GetTargetOrderForLogicalIndex(int logicalIndex)
         {
-            int orderInEnabled = GetEnabledSlot(logicalIndex);
-            if (orderInEnabled < 0)
-            {
-                return 0;
-            }
-
-            if (IsFiniteMode())
-            {
-                return orderInEnabled;
-            }
-
-            int count = _enabledIndices.Count;
-            int referenceOrder = GetReferenceOrderForProgrammaticNavigation();
-            int cycle = FloorDiv(referenceOrder, count);
-            int candidate = (cycle * count) + orderInEnabled;
-            return RefineOrderToNearestCycle(candidate, _scrollOffset);
+            return ComputeNearestOrderForLogical(logicalIndex, _scrollOffset);
         }
 
+        /// <summary>
+        /// Picks the absolute order for <paramref name="logicalIndex"/> whose lattice center
+        /// is closest to <paramref name="referenceOffset"/> (searches all wrap cycles).
+        /// </summary>
         private int RefineOrderToNearestCycle(int candidate, float referenceOffset)
         {
             int count = _enabledIndices.Count;
@@ -698,23 +758,31 @@ namespace EasyScroller
                 return candidate;
             }
 
-            int candidatePlus = candidate + count;
-            int candidateMinus = candidate - count;
-            float bestDistance = Mathf.Abs(GetOrderCenterPosition(candidate) - referenceOffset);
             int bestOrder = candidate;
-
-            float plusDistance = Mathf.Abs(GetOrderCenterPosition(candidatePlus) - referenceOffset);
-            if (plusDistance < bestDistance)
+            float bestDistance = Mathf.Abs(GetOrderCenterPosition(bestOrder) - referenceOffset);
+            bool improved;
+            do
             {
-                bestDistance = plusDistance;
-                bestOrder = candidatePlus;
-            }
+                improved = false;
+                int plus = bestOrder + count;
+                int minus = bestOrder - count;
+                float plusDistance = Mathf.Abs(GetOrderCenterPosition(plus) - referenceOffset);
+                if (plusDistance < bestDistance)
+                {
+                    bestDistance = plusDistance;
+                    bestOrder = plus;
+                    improved = true;
+                }
 
-            float minusDistance = Mathf.Abs(GetOrderCenterPosition(candidateMinus) - referenceOffset);
-            if (minusDistance < bestDistance)
-            {
-                bestOrder = candidateMinus;
+                float minusDistance = Mathf.Abs(GetOrderCenterPosition(minus) - referenceOffset);
+                if (minusDistance < bestDistance)
+                {
+                    bestDistance = minusDistance;
+                    bestOrder = minus;
+                    improved = true;
+                }
             }
+            while (improved);
 
             return bestOrder;
         }
@@ -932,29 +1000,128 @@ namespace EasyScroller
             VisualItem target = ResolveAdjacentChainVisual(current, sign, steps);
             if (!IsVisualActiveInChain(target) || target == current)
             {
-                int targetOrder = ClampOrderForMode(current.AbsoluteOrderIndex + (sign * steps));
+                int fromSlot = GetEnabledSlot(current.LogicalIndex);
+                if (fromSlot < 0)
+                {
+                    return false;
+                }
+
+                int count = _enabledIndices.Count;
+                int targetSlot = IsFiniteMode()
+                    ? fromSlot + (sign * steps)
+                    : Mod(fromSlot + (sign * steps), count);
+                if (IsFiniteMode() && (targetSlot < 0 || targetSlot >= count))
+                {
+                    return false;
+                }
+
+                int targetLogical = _enabledIndices[targetSlot];
+                int targetOrder = ComputeNearestOrderForLogical(targetLogical, _scrollOffset);
                 float targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
-                return ScrollToOffsetAndOrder(targetOffset, targetOrder, true);
+                return ScrollToOffsetAndOrder(targetOffset, targetOrder, targetLogical, animated: true);
             }
 
             return CenterChainVisual(target, animated: true);
         }
 
-        private bool ScrollToOffsetAndOrder(float targetOffset, int targetOrder, bool animated)
+        private bool TryEnsureChainVisualForOrder(int logicalIndex, int targetOrder, float targetOffset, bool animated)
+        {
+            if (FindChainVisualByOrder(targetOrder) != null)
+            {
+                return true;
+            }
+
+            if (logicalIndex < 0 || logicalIndex >= _items.Count)
+            {
+                return false;
+            }
+
+            if (!IsFiniteMode() && TryInsertVisualForAbsoluteOrder(targetOrder, logicalIndex))
+            {
+                return true;
+            }
+
+            float savedOffset = _scrollOffset;
+            float savedLastOffset = _lastScrollOffsetForChainMotion;
+            bool savedSkipCollective = _skipCollectiveScrollThisFrame;
+
+            _scrollOffset = ClampOffsetForMode(targetOffset);
+            _lastScrollOffsetForChainMotion = _scrollOffset;
+            _skipCollectiveScrollThisFrame = true;
+            _deferChainTrim = true;
+            SyncVisibleWindow();
+            _deferChainTrim = false;
+
+            if (FindChainVisualByOrder(targetOrder) == null && !IsFiniteMode())
+            {
+                TryInsertVisualForAbsoluteOrder(targetOrder, logicalIndex);
+                if (FindChainVisualByOrder(targetOrder) == null)
+                {
+                    EnsureInfiniteViewportOrderCoverage(GetVisibleHalfExtent());
+                }
+            }
+
+            bool found = FindChainVisualByOrder(targetOrder) != null;
+            if (animated)
+            {
+                _scrollOffset = savedOffset;
+                _lastScrollOffsetForChainMotion = savedLastOffset;
+                _skipCollectiveScrollThisFrame = savedSkipCollective;
+                if (found && _chainHead != null)
+                {
+                    for (VisualItem v = _chainHead; v != null; v = v.Next)
+                    {
+                        SetVisualAxisToLatticeOrder(v, v.AbsoluteOrderIndex);
+                    }
+                }
+            }
+
+            return found;
+        }
+
+        private bool ScrollToOffsetAndOrder(float targetOffset, int targetOrder, int targetLogical, bool animated)
         {
             if (_enabledIndices.Count == 0 || IsNavigationBlockedByInitialReveal())
             {
                 return false;
             }
 
+            VisualItem targetVisual = null;
+            if (targetLogical >= 0)
+            {
+                TryResolveScrollTargetForLogical(
+                    targetLogical,
+                    out targetVisual,
+                    out targetOrder,
+                    out targetOffset);
+
+                if (IsVisualAlreadyCenteredForScroll(targetVisual, targetLogical))
+                {
+                    BeginProgrammaticNavigation();
+                    StopUserMotionForProgrammaticScroll();
+                    SettleScrollAtVisual(targetVisual);
+                    _hasProgrammaticStepAnchor = true;
+                    _programmaticStepOrder = targetVisual.AbsoluteOrderIndex;
+                    SyncVisibleWindow();
+                    RefreshLinkedScrollbarState();
+                    return true;
+                }
+            }
+            else
+            {
+                targetVisual = FindChainVisualByOrder(targetOrder);
+            }
+
+            TryEnsureChainVisualForOrder(targetLogical, targetOrder, targetOffset, animated);
+
             BeginProgrammaticNavigation();
             StopUserMotionForProgrammaticScroll();
             _hasProgrammaticStepAnchor = true;
             _programmaticStepOrder = ClampOrderForMode(targetOrder);
 
+            targetVisual = FindChainVisualByOrder(_programmaticStepOrder);
             if (ShouldSmoothProgrammaticScroll(animated))
             {
-                VisualItem targetVisual = FindChainVisualByOrder(_programmaticStepOrder);
                 if (IsVisualActiveInChain(targetVisual))
                 {
                     BeginAnimatedSnapToVisual(targetVisual);
@@ -970,7 +1137,6 @@ namespace EasyScroller
             }
             else
             {
-                VisualItem targetVisual = FindChainVisualByOrder(_programmaticStepOrder);
                 if (IsVisualActiveInChain(targetVisual))
                 {
                     SettleScrollAtVisual(targetVisual);
@@ -978,6 +1144,7 @@ namespace EasyScroller
                 else
                 {
                     _scrollOffset = ClampOffsetForMode(targetOffset);
+                    _lastScrollOffsetForChainMotion = _scrollOffset;
                     ClearActiveSnapState();
                     _hasSettledOrder = true;
                     _settledOrder = _programmaticStepOrder;
@@ -1075,9 +1242,7 @@ namespace EasyScroller
             // (can happen when a splice fallback replaced head without unlinking).
             ReleaseOrphanedChainIslands();
 
-            // 2) Reconcile: drop chain visuals that no longer reference enabled
-            //    logicals, drop everything past a non-sequential break, then
-            //    refresh AbsoluteOrderIndex values relative to the chain head.
+            // 2) Drop disabled visuals, prune invalid adjacent dupes, sync orders along links.
             ReconcileChainLogicalsAndOrders();
             SyncNavigationAnchorsAfterChainReconcile();
 
@@ -1117,10 +1282,30 @@ namespace EasyScroller
                 _lastScrollOffsetForChainMotion = _scrollOffset;
             }
 
-            // 5) Grow / trim coverage at chain edges.
+            // 5) Spawn missing catalog neighbors at chain edges, then trim.
             float halfExtent = GetVisibleHalfExtent();
-            GrowChainCoverage(halfExtent);
+            EnsureViewportCoverageFromCatalog(halfExtent);
+
             TrimChainCoverage(halfExtent);
+
+            if (_enabledIndices.Count > 1)
+            {
+                PruneAdjacentDuplicateLogicalsOnChain();
+                PruneDuplicateLogicalInstancesOnChain();
+            }
+
+            if (!IsFiniteMode() && _chainHead != null)
+            {
+                SyncOrdersAlongChainLinks();
+            }
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            if (_validateChainThisFrame)
+            {
+                EnsureChainValidityWithFallback("mutation");
+                _validateChainThisFrame = false;
+            }
+#endif
 
             // Center highlight follows whichever chain visual is actually nearest
             // the viewport axis — not the abstract lattice order (which drifts
@@ -1303,19 +1488,22 @@ namespace EasyScroller
             return Mathf.Lerp(current, targetAxis, moveT);
         }
 
+        /// <summary>
+        /// Catalog is source of truth; chain is cleaned and orders follow link sequence.
+        /// Does not truncate the chain on slot gaps — edge spawn fills missing catalog entries.
+        /// </summary>
         private void ReconcileChainLogicalsAndOrders()
         {
-            // 1) Drop chain visuals whose logical was disabled or removed.
             VisualItem v = _chainHead;
             while (v != null)
             {
                 VisualItem next = v.Next;
-                int slot = GetEnabledSlot(v.LogicalIndex);
-                if (slot < 0)
+                if (GetEnabledSlot(v.LogicalIndex) < 0)
                 {
                     DetachFromChain(v);
                     ReleaseVisual(v);
                 }
+
                 v = next;
             }
 
@@ -1324,67 +1512,62 @@ namespace EasyScroller
                 return;
             }
 
-            // 2) Find the first non-sequential break (in either direction).
-            //    Drop everything past it. This handles inserts / reorders by
-            //    forcing the affected side of the chain to rebuild from grow
-            //    coverage on subsequent passes.
-            int count = _enabledIndices.Count;
-            v = _chainHead;
-            while (v != null && v.Next != null)
+            if (_enabledIndices.Count > 1)
             {
-                int slotV = GetEnabledSlot(v.LogicalIndex);
-                int slotNext = GetEnabledSlot(v.Next.LogicalIndex);
-                bool sequential = slotV >= 0 && slotNext >= 0 && IsLogicallySequentialForward(slotV, slotNext, count);
-                if (!sequential)
+                PruneAdjacentDuplicateLogicalsOnChain();
+                if (_chainHead == null)
                 {
-                    ReleaseChainFrom(v.Next, forward: true);
-                    break;
+                    return;
                 }
-                v = v.Next;
+
+                PruneDuplicateLogicalInstancesOnChain();
+                if (_chainHead == null)
+                {
+                    return;
+                }
             }
 
+            SyncOrdersAlongChainLinks();
+        }
+
+        private void SyncOrdersAlongChainLinks()
+        {
             if (_chainHead == null)
             {
                 return;
             }
 
-            // 3) Reassign AbsoluteOrderIndex on each chain visual.
             if (IsFiniteMode())
             {
-                // Finite: order is the enabled slot (0..count-1). ScrollToLogicalIndex,
-                // snap, and lattice math all key off that slot — not a running index from
-                // the head, which would drift after add/remove (e.g. orders 2,3,4,5 for
-                // four items) and break lookup by order.
-                v = _chainHead;
-                while (v != null)
+                for (VisualItem visual = _chainHead; visual != null; visual = visual.Next)
                 {
-                    int slot = GetEnabledSlot(v.LogicalIndex);
+                    int slot = GetEnabledSlot(visual.LogicalIndex);
                     if (slot >= 0)
                     {
-                        v.AbsoluteOrderIndex = slot;
+                        visual.AbsoluteOrderIndex = slot;
                     }
-                    v = v.Next;
                 }
 
                 if (!_relayoutActive)
                 {
                     AlignFiniteChainVisualAxesToLattice();
                 }
+
+                return;
             }
-            else
+
+            int headOrder = _chainHead.AbsoluteOrderIndex;
+            if (ResolveLogicalIndexFromOrder(headOrder) != _chainHead.LogicalIndex)
             {
-                // Infinite: head order tracks scroll offset on the wrapped lattice;
-                // successors use consecutive lattice indices (same logical may repeat).
-                int headOrder = ComputeNearestOrderForLogical(_chainHead.LogicalIndex, _scrollOffset);
-                _chainHead.AbsoluteOrderIndex = headOrder;
-                VisualItem cursor = _chainHead.Next;
-                int orderValue = headOrder;
-                while (cursor != null)
-                {
-                    orderValue++;
-                    cursor.AbsoluteOrderIndex = orderValue;
-                    cursor = cursor.Next;
-                }
+                headOrder = ComputeNearestOrderForLogical(_chainHead.LogicalIndex, _scrollOffset);
+            }
+
+            _chainHead.AbsoluteOrderIndex = headOrder;
+            int orderValue = headOrder;
+            for (VisualItem cursor = _chainHead.Next; cursor != null; cursor = cursor.Next)
+            {
+                orderValue++;
+                cursor.AbsoluteOrderIndex = orderValue;
             }
         }
 
@@ -1508,9 +1691,23 @@ namespace EasyScroller
             VisualItem targetVisual = ResolveSnapTargetVisual();
             if (targetVisual != null)
             {
+                float targetOffset = ComputeScrollOffsetToCenterVisual(targetVisual);
+                float targetAxis = GetVisualAxis(targetVisual);
+                if (Mathf.Abs(targetAxis) <= snap_position_epsilon &&
+                    Mathf.Abs(targetOffset - _scrollOffset) <= snap_position_epsilon)
+                {
+                    _hasSnapTarget = false;
+                    _snapVelocity = 0f;
+                    _hasSettledOrder = true;
+                    _settledOrder = targetVisual.AbsoluteOrderIndex;
+                    _settledChainVisual = targetVisual;
+                    _snapTargetChainVisual = targetVisual;
+                    return;
+                }
+
                 _snapTargetChainVisual = targetVisual;
                 _snapTargetOrder = targetVisual.AbsoluteOrderIndex;
-                _snapTargetOffset = ComputeScrollOffsetToCenterVisual(targetVisual);
+                _snapTargetOffset = targetOffset;
             }
             else
             {
@@ -1522,6 +1719,13 @@ namespace EasyScroller
 
             _hasSnapTarget = true;
             _snapTargetLockedUntilUserInput = true;
+        }
+
+        private bool IsIdleOnSettledSnapVisual()
+        {
+            return _hasSettledOrder &&
+                   IsVisualActiveInChain(_settledChainVisual) &&
+                   Mathf.Abs(GetVisualAxis(_settledChainVisual)) <= snap_switch_dead_zone;
         }
 
         private void RefreshCenteredVisualFromChain()
@@ -1646,44 +1850,125 @@ namespace EasyScroller
             return null;
         }
 
-        private VisualItem FindFirstChainVisualWithEnabledSlotAtLeast(int minEnabledSlot)
+        private void PruneAdjacentDuplicateLogicalsOnChain()
         {
-            VisualItem best = null;
-            int bestSlot = int.MaxValue;
-            VisualItem v = _chainHead;
-            while (v != null)
+            if (_enabledIndices.Count <= 1 || _chainHead == null)
             {
-                int slot = GetEnabledSlot(v.LogicalIndex);
-                if (slot >= minEnabledSlot && slot < bestSlot)
-                {
-                    bestSlot = slot;
-                    best = v;
-                }
-
-                v = v.Next;
+                return;
             }
 
-            return best;
+            bool removed;
+            do
+            {
+                removed = false;
+                VisualItem v = _chainHead;
+                while (v != null && v.Next != null)
+                {
+                    if (v.LogicalIndex == v.Next.LogicalIndex)
+                    {
+                        ReleaseChainFrom(v.Next, forward: true);
+                        removed = true;
+                        break;
+                    }
+
+                    v = v.Next;
+                }
+            }
+            while (removed && _chainHead != null);
         }
 
-        private VisualItem FindLastChainVisualWithEnabledSlotAtMost(int maxEnabledSlot)
+        /// <summary>
+        /// Keeps at most one chain node per logical index (used after insert and in finite mode).
+        /// </summary>
+        private void PruneToSingleVisualPerLogicalOnChain()
         {
-            VisualItem best = null;
-            int bestSlot = -1;
+            if (_chainHead == null)
+            {
+                return;
+            }
+
+            var seenLogicals = new HashSet<int>();
             VisualItem v = _chainHead;
             while (v != null)
             {
-                int slot = GetEnabledSlot(v.LogicalIndex);
-                if (slot <= maxEnabledSlot && slot > bestSlot)
+                VisualItem next = v.Next;
+                if (!seenLogicals.Add(v.LogicalIndex))
                 {
-                    bestSlot = slot;
-                    best = v;
+                    DetachFromChain(v);
+                    ReleaseVisual(v);
                 }
 
-                v = v.Next;
+                v = next;
+            }
+        }
+
+        /// <summary>
+        /// Infinite scroll: allow the same logical only after a full catalog lap on the chain.
+        /// </summary>
+        private void PrunePrematureDuplicateLogicalInstancesOnChain()
+        {
+            int count = _enabledIndices.Count;
+            if (_chainHead == null || count <= 1 || IsFiniteMode())
+            {
+                return;
             }
 
-            return best;
+            var firstByLogical = new Dictionary<int, VisualItem>();
+            VisualItem v = _chainHead;
+            while (v != null)
+            {
+                VisualItem next = v.Next;
+                int logical = v.LogicalIndex;
+                if (firstByLogical.TryGetValue(logical, out VisualItem first))
+                {
+                    if (Mathf.Abs(v.AbsoluteOrderIndex - first.AbsoluteOrderIndex) < count)
+                    {
+                        DetachFromChain(v);
+                        ReleaseVisual(v);
+                    }
+                    else
+                    {
+                        firstByLogical[logical] = v;
+                    }
+                }
+                else
+                {
+                    firstByLogical[logical] = v;
+                }
+
+                v = next;
+            }
+        }
+
+        private void PruneDuplicateLogicalInstancesOnChain()
+        {
+            if (IsFiniteMode())
+            {
+                PruneToSingleVisualPerLogicalOnChain();
+                return;
+            }
+
+            PrunePrematureDuplicateLogicalInstancesOnChain();
+        }
+
+        private bool HasChainVisualForLogicalNearOrder(int logicalIndex, int order)
+        {
+            int count = _enabledIndices.Count;
+            if (count <= 0)
+            {
+                return false;
+            }
+
+            for (VisualItem v = _chainHead; v != null; v = v.Next)
+            {
+                if (v.LogicalIndex == logicalIndex &&
+                    Mathf.Abs(v.AbsoluteOrderIndex - order) < count)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void ShiftChainLogicalIndicesFrom(int fromLogicalInclusive, int delta)
@@ -1695,6 +1980,7 @@ namespace EasyScroller
                 {
                     v.LogicalIndex += delta;
                     ApplyRuntimeInfoBinding(v, v.LogicalIndex);
+                    SyncVisualContentToCatalog(v);
                 }
                 v = v.Next;
             }
@@ -1758,9 +2044,25 @@ namespace EasyScroller
                 return false;
             }
 
-            if (FindChainVisualByLogicalIndex(logicalIndex) != null)
+            // Finite: one active node per logical. Infinite tiling may already show
+            // this logical elsewhere on the chain — still splice the new list entry.
+            if (IsFiniteMode())
             {
-                return true;
+                VisualItem existing = FindChainVisualByLogicalIndex(logicalIndex);
+                if (existing != null)
+                {
+                    int slot = GetEnabledSlot(logicalIndex);
+                    if (slot >= 0)
+                    {
+                        existing.AbsoluteOrderIndex = slot;
+                        if (!_relayoutActive)
+                        {
+                            SetVisualAxisToLatticeOrder(existing, slot);
+                        }
+                    }
+
+                    return true;
+                }
             }
 
             int newSlot = GetEnabledSlot(logicalIndex);
@@ -1776,90 +2078,55 @@ namespace EasyScroller
                 return false;
             }
 
-            int count = _enabledIndices.Count;
-            if (_chainHead == null || count <= 1)
+            if (_chainHead == null)
             {
                 InsertAsOnlyChainNode(newVisual);
-                SetVisualAxis(newVisual, 0f);
+                SetVisualAxisToLatticeOrder(newVisual, order);
                 return true;
             }
 
-            if (newSlot == 0)
+            bool attached = TryAttachSplicedVisualByEnabledSlot(newVisual, newSlot, order);
+            if (!attached)
             {
-                int succLogical = _enabledIndices[1];
-                VisualItem succVisual = FindChainVisualByLogicalIndex(succLogical);
-                if (succVisual == null)
-                {
-                    succVisual = FindFirstChainVisualWithEnabledSlotAtLeast(1);
-                }
-
-                if (succVisual != null)
-                {
-                    InsertChainLinkBefore(succVisual, newVisual);
-                    PlaceSplicedVisualBetween(newVisual, null, succVisual);
-                    newVisual.AbsoluteOrderIndex = succVisual.AbsoluteOrderIndex - 1;
-                    return true;
-                }
-            }
-            else if (newSlot == count - 1)
-            {
-                int predLogical = _enabledIndices[newSlot - 1];
-                VisualItem predVisual = FindChainVisualByLogicalIndex(predLogical);
-                if (predVisual == null)
-                {
-                    predVisual = FindLastChainVisualWithEnabledSlotAtMost(newSlot - 1);
-                }
-
-                if (predVisual != null)
-                {
-                    InsertChainLinkAfter(predVisual, newVisual);
-                    PlaceSplicedVisualBetween(newVisual, predVisual, null);
-                    newVisual.AbsoluteOrderIndex = predVisual.AbsoluteOrderIndex + 1;
-                    return true;
-                }
-            }
-            else
-            {
-                int predLogical = _enabledIndices[newSlot - 1];
-                int succLogical = _enabledIndices[newSlot + 1];
-                VisualItem predVisual = FindChainVisualByLogicalIndex(predLogical);
-                VisualItem succVisual = FindChainVisualByLogicalIndex(succLogical);
-                if (predVisual == null)
-                {
-                    predVisual = FindLastChainVisualWithEnabledSlotAtMost(newSlot - 1);
-                }
-
-                if (succVisual == null)
-                {
-                    succVisual = FindFirstChainVisualWithEnabledSlotAtLeast(newSlot + 1);
-                }
-
-                if (predVisual != null && succVisual != null && predVisual != succVisual)
-                {
-                    InsertChainLinkAfter(predVisual, newVisual);
-                    PlaceSplicedVisualBetween(newVisual, predVisual, succVisual);
-                    newVisual.AbsoluteOrderIndex = predVisual.AbsoluteOrderIndex + 1;
-                    return true;
-                }
-
-                if (predVisual != null)
-                {
-                    InsertChainLinkAfter(predVisual, newVisual);
-                    PlaceSplicedVisualBetween(newVisual, predVisual, null);
-                    newVisual.AbsoluteOrderIndex = predVisual.AbsoluteOrderIndex + 1;
-                    return true;
-                }
-
-                if (succVisual != null)
-                {
-                    InsertChainLinkBefore(succVisual, newVisual);
-                    PlaceSplicedVisualBetween(newVisual, null, succVisual);
-                    newVisual.AbsoluteOrderIndex = succVisual.AbsoluteOrderIndex - 1;
-                    return true;
-                }
+                ReleaseVisual(newVisual);
+                return false;
             }
 
-            return TryAttachSplicedVisualByEnabledSlot(newVisual, newSlot, order);
+            return true;
+        }
+
+        /// <summary>
+        /// Ensures a newly added/edited logical has at least one chain visual after splice.
+        /// </summary>
+        private void EnsureLogicalVisualOnChain(int logicalIndex)
+        {
+            if (logicalIndex < 0 || logicalIndex >= _items.Count || !_items[logicalIndex].Enabled)
+            {
+                return;
+            }
+
+            if (IsFiniteMode() && FindChainVisualByLogicalIndex(logicalIndex) != null)
+            {
+                return;
+            }
+
+            int newSlot = GetEnabledSlot(logicalIndex);
+            if (newSlot < 0)
+            {
+                return;
+            }
+
+            int order = ComputeNearestOrderForLogical(logicalIndex, _scrollOffset);
+            VisualItem newVisual = AcquireAndAttachFreshVisual(order, logicalIndex);
+            if (newVisual == null)
+            {
+                return;
+            }
+
+            if (!TryAttachSplicedVisualByEnabledSlot(newVisual, newSlot, order))
+            {
+                ReleaseVisual(newVisual);
+            }
         }
 
         private bool TryAttachSplicedVisualByEnabledSlot(VisualItem newVisual, int newSlot, int order)
@@ -1872,58 +2139,250 @@ namespace EasyScroller
             if (_chainHead == null)
             {
                 InsertAsOnlyChainNode(newVisual);
-                SetVisualAxis(newVisual, 0f);
+                SetVisualAxisToLatticeOrder(newVisual, order);
                 newVisual.AbsoluteOrderIndex = order;
                 return true;
             }
 
-            if (newSlot <= GetEnabledSlot(_chainHead.LogicalIndex))
+            if (!TrySelectBestSpliceAnchor(newSlot, order, out VisualItem pred, out VisualItem succ, out int attachOrder))
             {
-                VisualItem oldHead = _chainHead;
-                PrependToHead(newVisual);
-                PlaceSplicedVisualBetween(newVisual, null, oldHead);
-                newVisual.AbsoluteOrderIndex = oldHead.AbsoluteOrderIndex - 1;
-                return true;
+                return false;
             }
 
-            if (_chainTail != null && newSlot >= GetEnabledSlot(_chainTail.LogicalIndex))
+            if (pred != null && succ != null)
             {
-                VisualItem oldTail = _chainTail;
-                AppendToTail(newVisual);
-                PlaceSplicedVisualBetween(newVisual, oldTail, null);
-                newVisual.AbsoluteOrderIndex = oldTail.AbsoluteOrderIndex + 1;
-                return true;
-            }
-
-            VisualItem pred = null;
-            int predSlot = -1;
-            VisualItem v = _chainHead;
-            while (v != null)
-            {
-                int slot = GetEnabledSlot(v.LogicalIndex);
-                if (slot < newSlot && slot > predSlot)
-                {
-                    predSlot = slot;
-                    pred = v;
-                }
-
-                v = v.Next;
-            }
-
-            if (pred != null)
-            {
-                VisualItem succ = pred.Next;
                 InsertChainLinkAfter(pred, newVisual);
                 PlaceSplicedVisualBetween(newVisual, pred, succ);
-                newVisual.AbsoluteOrderIndex = pred.AbsoluteOrderIndex + 1;
-                return true;
+            }
+            else if (pred != null)
+            {
+                InsertChainLinkAfter(pred, newVisual);
+                PlaceSplicedVisualBetween(newVisual, pred, null);
+            }
+            else if (succ != null)
+            {
+                InsertChainLinkBefore(succ, newVisual);
+                PlaceSplicedVisualBetween(newVisual, null, succ);
+            }
+            else
+            {
+                return false;
             }
 
-            VisualItem fallbackHead = _chainHead;
-            PrependToHead(newVisual);
-            PlaceSplicedVisualBetween(newVisual, null, fallbackHead);
-            newVisual.AbsoluteOrderIndex = fallbackHead.AbsoluteOrderIndex - 1;
+            if (IsFiniteMode())
+            {
+                newVisual.AbsoluteOrderIndex = attachOrder;
+            }
+            else
+            {
+                newVisual.AbsoluteOrderIndex = ComputeInfiniteSpliceAttachOrder(
+                    newSlot,
+                    order,
+                    pred,
+                    succ);
+            }
+
             return true;
+        }
+
+        /// <summary>
+        /// Infinite scroll: absolute order must satisfy Mod(order, count) == newSlot.
+        /// Blind pred±1 / head−1 is wrong across cycle boundaries (e.g. slot 0 before head−1 → slot 9).
+        /// </summary>
+        private int ComputeInfiniteSpliceAttachOrder(int newSlot, int targetOrder, VisualItem pred, VisualItem succ)
+        {
+            int count = _enabledIndices.Count;
+            if (newSlot < 0 || newSlot >= count)
+            {
+                return targetOrder;
+            }
+
+            int logical = _enabledIndices[newSlot];
+
+            if (pred != null && succ != null)
+            {
+                int lo = pred.AbsoluteOrderIndex + 1;
+                int hi = succ.AbsoluteOrderIndex - 1;
+                int bestOrder = lo;
+                int bestDistance = int.MaxValue;
+                bool found = false;
+                for (int candidate = lo; candidate <= hi; candidate++)
+                {
+                    if (Mod(candidate, count) != newSlot)
+                    {
+                        continue;
+                    }
+
+                    found = true;
+                    int distance = Mathf.Abs(candidate - targetOrder);
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        bestOrder = candidate;
+                    }
+                }
+
+                if (found)
+                {
+                    return bestOrder;
+                }
+            }
+
+            int resolvedOrder = ComputeNearestOrderForLogical(logical, _scrollOffset);
+            if (succ != null)
+            {
+                while (resolvedOrder >= succ.AbsoluteOrderIndex)
+                {
+                    resolvedOrder -= count;
+                }
+            }
+            else if (pred != null)
+            {
+                while (resolvedOrder <= pred.AbsoluteOrderIndex)
+                {
+                    resolvedOrder += count;
+                }
+            }
+
+            return resolvedOrder;
+        }
+
+        private bool TrySelectBestSpliceAnchor(int newSlot, int targetOrder, out VisualItem bestPred, out VisualItem bestSucc, out int bestAttachOrder)
+        {
+            VisualItem candidatePred = null;
+            VisualItem candidateSucc = null;
+            int candidateAttachOrder = 0;
+
+            bool found = false;
+            int bestDistance = int.MaxValue;
+
+            for (VisualItem v = _chainHead; v != null && v.Next != null; v = v.Next)
+            {
+                VisualItem succ = v.Next;
+                if (!AreSpliceNeighborsSequential(v, succ, newSlot))
+                {
+                    continue;
+                }
+
+                int attachOrder = IsFiniteMode()
+                    ? v.AbsoluteOrderIndex + 1
+                    : ComputeInfiniteSpliceAttachOrder(newSlot, targetOrder, v, succ);
+                int distance = Mathf.Abs(attachOrder - targetOrder);
+                if (attachOrder == targetOrder)
+                {
+                    distance = 0;
+                }
+
+                if (!found || distance < bestDistance)
+                {
+                    found = true;
+                    bestDistance = distance;
+                    candidatePred = v;
+                    candidateSucc = succ;
+                    candidateAttachOrder = attachOrder;
+                }
+            }
+
+            if (CanSpliceBeforeSucc(_chainHead, newSlot))
+            {
+                int attachOrder = IsFiniteMode()
+                    ? _chainHead.AbsoluteOrderIndex - 1
+                    : ComputeInfiniteSpliceAttachOrder(newSlot, targetOrder, null, _chainHead);
+                int distance = Mathf.Abs(attachOrder - targetOrder);
+                if (attachOrder == targetOrder)
+                {
+                    distance = 0;
+                }
+
+                if (!found || distance < bestDistance)
+                {
+                    found = true;
+                    bestDistance = distance;
+                    candidatePred = null;
+                    candidateSucc = _chainHead;
+                    candidateAttachOrder = attachOrder;
+                }
+            }
+
+            if (CanSpliceAfterPred(_chainTail, newSlot))
+            {
+                int attachOrder = IsFiniteMode()
+                    ? _chainTail.AbsoluteOrderIndex + 1
+                    : ComputeInfiniteSpliceAttachOrder(newSlot, targetOrder, _chainTail, null);
+                int distance = Mathf.Abs(attachOrder - targetOrder);
+                if (attachOrder == targetOrder)
+                {
+                    distance = 0;
+                }
+
+                if (!found || distance < bestDistance)
+                {
+                    found = true;
+                    candidatePred = _chainTail;
+                    candidateSucc = null;
+                    candidateAttachOrder = attachOrder;
+                }
+            }
+
+            bestPred = candidatePred;
+            bestSucc = candidateSucc;
+            bestAttachOrder = candidateAttachOrder;
+            return found;
+        }
+
+        private bool CanSpliceAfterPred(VisualItem predVisual, int newSlot)
+        {
+            if (predVisual == null)
+            {
+                return false;
+            }
+
+            int count = _enabledIndices.Count;
+            int predSlot = GetEnabledSlot(predVisual.LogicalIndex);
+            if (predSlot < 0 || newSlot < 0 || newSlot >= count)
+            {
+                return false;
+            }
+
+            return IsLogicallySequentialForward(predSlot, newSlot, count);
+        }
+
+        private bool CanSpliceBeforeSucc(VisualItem succVisual, int newSlot)
+        {
+            if (succVisual == null)
+            {
+                return false;
+            }
+
+            int count = _enabledIndices.Count;
+            int succSlot = GetEnabledSlot(succVisual.LogicalIndex);
+            if (succSlot < 0 || newSlot < 0 || newSlot >= count)
+            {
+                return false;
+            }
+
+            return IsLogicallySequentialForward(newSlot, succSlot, count);
+        }
+
+        /// <summary>
+        /// True when <paramref name="newSlot"/> belongs between two linked chain nodes.
+        /// After <see cref="ShiftChainLogicalIndicesFrom"/>, pred/succ slots may be pred+1 and pred+2
+        /// (a gap); only pred→new and new→succ must be catalog-sequential, not pred→succ.
+        /// </summary>
+        private bool AreSpliceNeighborsSequential(VisualItem predVisual, VisualItem succVisual, int newSlot)
+        {
+            if (!CanSpliceAfterPred(predVisual, newSlot) || !CanSpliceBeforeSucc(succVisual, newSlot))
+            {
+                return false;
+            }
+
+            int count = _enabledIndices.Count;
+            int predSlot = GetEnabledSlot(predVisual.LogicalIndex);
+            int succSlot = GetEnabledSlot(succVisual.LogicalIndex);
+            return predSlot >= 0 &&
+                   succSlot >= 0 &&
+                   IsLogicallySequentialForward(predSlot, newSlot, count) &&
+                   IsLogicallySequentialForward(newSlot, succSlot, count);
         }
 
         private void PlaceSplicedVisualBetween(VisualItem newVisual, VisualItem predVisual, VisualItem succVisual)
@@ -1997,6 +2456,97 @@ namespace EasyScroller
             return best;
         }
 
+        private VisualItem FindChainVisualNearestToAxisForLogical(int logicalIndex, float targetAxis)
+        {
+            VisualItem best = null;
+            float bestDist = float.MaxValue;
+            VisualItem v = _chainHead;
+            while (v != null)
+            {
+                if (v.LogicalIndex == logicalIndex)
+                {
+                    float dist = Mathf.Abs(GetVisualAxis(v) - targetAxis);
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        best = v;
+                    }
+                }
+
+                v = v.Next;
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// Infinite scroll: prefer the on-chain instance already near the viewport over another wrap cycle.
+        /// </summary>
+        private bool TryResolveScrollTargetForLogical(
+            int logicalIndex,
+            out VisualItem targetVisual,
+            out int targetOrder,
+            out float targetOffset)
+        {
+            targetVisual = null;
+            targetOrder = 0;
+            targetOffset = 0f;
+
+            if (logicalIndex < 0 || logicalIndex >= _items.Count)
+            {
+                return false;
+            }
+
+            VisualItem centeredCandidate = null;
+            if (IsVisualActiveInChain(_centeredChainVisual) && _centeredChainVisual.LogicalIndex == logicalIndex)
+            {
+                centeredCandidate = _centeredChainVisual;
+            }
+            else if (_hasSettledOrder &&
+                     IsVisualActiveInChain(_settledChainVisual) &&
+                     _settledChainVisual.LogicalIndex == logicalIndex)
+            {
+                centeredCandidate = _settledChainVisual;
+            }
+            else
+            {
+                centeredCandidate = FindChainVisualNearestToAxisForLogical(logicalIndex, 0f);
+            }
+
+            if (IsVisualActiveInChain(centeredCandidate) &&
+                Mathf.Abs(GetVisualAxis(centeredCandidate)) <= snap_switch_dead_zone)
+            {
+                targetVisual = centeredCandidate;
+                targetOrder = centeredCandidate.AbsoluteOrderIndex;
+                targetOffset = ClampOffsetForMode(ComputeScrollOffsetToCenterVisual(centeredCandidate));
+                return true;
+            }
+
+            if (!IsFiniteMode())
+            {
+                VisualItem onChainNearest = FindChainVisualNearestToAxisForLogical(logicalIndex, 0f);
+                if (IsVisualActiveInChain(onChainNearest))
+                {
+                    targetVisual = onChainNearest;
+                    targetOrder = onChainNearest.AbsoluteOrderIndex;
+                    targetOffset = ClampOffsetForMode(ComputeScrollOffsetToCenterVisual(onChainNearest));
+                    return true;
+                }
+            }
+
+            targetOrder = ComputeNearestOrderForLogical(logicalIndex, _scrollOffset);
+            targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
+            targetVisual = FindChainVisualByOrder(targetOrder);
+            return true;
+        }
+
+        private bool IsVisualAlreadyCenteredForScroll(VisualItem visual, int logicalIndex)
+        {
+            return IsVisualActiveInChain(visual) &&
+                   visual.LogicalIndex == logicalIndex &&
+                   Mathf.Abs(GetVisualAxis(visual)) <= snap_switch_dead_zone;
+        }
+
         private void ReleaseChainFrom(VisualItem fromInclusive, bool forward)
         {
             VisualItem cursor = fromInclusive;
@@ -2009,21 +2559,173 @@ namespace EasyScroller
             }
         }
 
-        private void GrowChainCoverage(float halfExtent)
+        /// <summary>
+        /// Extends the visible chain by spawning the next/prev enabled catalog entry at each edge.
+        /// </summary>
+        private void EnsureViewportCoverageFromCatalog(float halfExtent)
         {
             if (_chainHead == null || _enabledIndices.Count == 0)
             {
                 return;
             }
 
-            GrowChainDirection(forward: true, halfExtent);
-            GrowChainDirection(forward: false, halfExtent);
+            SpawnCatalogNeighborAtEdge(forward: false, halfExtent);
+            SpawnCatalogNeighborAtEdge(forward: true, halfExtent);
         }
 
-        private void GrowChainDirection(bool forward, float halfExtent)
+        /// <summary>
+        /// Infinite lists: ensure every absolute order needed for the viewport exists on the chain.
+        /// Needed for small catalogs (e.g. two items) where edge grow cannot wrap across chain ends.
+        /// </summary>
+        private void EnsureInfiniteViewportOrderCoverage(float halfExtent)
+        {
+            if (IsFiniteMode() || _chainHead == null || _enabledIndices.Count < 2)
+            {
+                return;
+            }
+
+            int centerOrder = ClampOrderForMode(GetNearestOrderToOffset(_scrollOffset));
+            CollectAbsoluteOrdersCoveringViewport(centerOrder, halfExtent, _viewportOrdersScratch);
+            if (_viewportOrdersScratch.Count == 0)
+            {
+                return;
+            }
+
+            bool inserted;
+            do
+            {
+                inserted = false;
+                for (int i = 0; i < _viewportOrdersScratch.Count; i++)
+                {
+                    int order = _viewportOrdersScratch[i];
+                    if (FindChainVisualByOrder(order) != null)
+                    {
+                        continue;
+                    }
+
+                    // Order gaps (e.g. -172 then -170) make FindChainVisualByOrder miss while the
+                    // chain already covers neighbors — re-sync first so we reuse nodes instead of spawning.
+                    if (FindChainVisualByOrder(order - 1) != null && FindChainVisualByOrder(order + 1) != null)
+                    {
+                        SyncOrdersAlongChainLinks();
+                        if (FindChainVisualByOrder(order) != null)
+                        {
+                            continue;
+                        }
+                    }
+
+                    int logical = ResolveLogicalIndexFromOrder(order);
+                    if (logical < 0)
+                    {
+                        continue;
+                    }
+
+                    if (TryInsertVisualForAbsoluteOrder(order, logical))
+                    {
+                        inserted = true;
+                        break;
+                    }
+                }
+            }
+            while (inserted);
+        }
+
+        private bool TryInsertVisualForAbsoluteOrder(int order, int logical)
+        {
+            if (FindChainVisualByOrder(order) != null)
+            {
+                return true;
+            }
+
+            VisualItem pred = FindChainVisualByOrder(order - 1);
+            VisualItem succ = FindChainVisualByOrder(order + 1);
+            if (pred == null && succ == null && _chainHead != null)
+            {
+                return false;
+            }
+
+            VisualItem visual = AcquireAndAttachFreshVisual(order, logical);
+            if (visual == null)
+            {
+                return false;
+            }
+
+            visual.AbsoluteOrderIndex = order;
+
+            if (pred != null)
+            {
+                InsertChainLinkAfter(pred, visual);
+                PlaceSplicedVisualBetween(visual, pred, succ);
+                return true;
+            }
+
+            if (succ != null)
+            {
+                InsertChainLinkBefore(succ, visual);
+                PlaceSplicedVisualBetween(visual, null, succ);
+                return true;
+            }
+
+            if (_chainHead == null)
+            {
+                InsertAsOnlyChainNode(visual);
+                SetVisualAxisToLatticeOrder(visual, order);
+                return true;
+            }
+
+            ReleaseVisual(visual);
+            return false;
+        }
+
+        /// <summary>
+        /// Next enabled catalog neighbor from the chain edge (by slot sequence, not chain scan).
+        /// </summary>
+        private bool TryResolveNextCatalogNeighbor(VisualItem edge, bool forward, out int nextOrder, out int nextLogical)
+        {
+            nextOrder = 0;
+            nextLogical = -1;
+            if (edge == null)
+            {
+                return false;
+            }
+
+            int count = _enabledIndices.Count;
+            int edgeSlot = GetEnabledSlot(edge.LogicalIndex);
+            if (edgeSlot < 0 || count <= 0)
+            {
+                return false;
+            }
+
+            int neighborSlot = forward
+                ? (IsFiniteMode() ? edgeSlot + 1 : Mod(edgeSlot + 1, count))
+                : (IsFiniteMode() ? edgeSlot - 1 : Mod(edgeSlot + count - 1, count));
+
+            if (IsFiniteMode() && (neighborSlot < 0 || neighborSlot >= count))
+            {
+                return false;
+            }
+
+            nextLogical = _enabledIndices[neighborSlot];
+            nextOrder = edge.AbsoluteOrderIndex + (forward ? 1 : -1);
+
+            if (IsFiniteMode())
+            {
+                nextOrder = neighborSlot;
+                return true;
+            }
+
+            if (count > 1 && ResolveLogicalIndexFromOrder(nextOrder) != nextLogical)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private void SpawnCatalogNeighborAtEdge(bool forward, float halfExtent)
         {
             int bufferRemaining = Mathf.Max(0, buffer_item_count);
-            int safety = _enabledIndices.Count * 4 + (buffer_item_count * 4) + 16;
+            int safety = _enabledIndices.Count + buffer_item_count + 8;
             while (safety-- > 0)
             {
                 VisualItem edge = forward ? _chainTail : _chainHead;
@@ -2032,22 +2734,29 @@ namespace EasyScroller
                     return;
                 }
 
-                int nextOrder = edge.AbsoluteOrderIndex + (forward ? 1 : -1);
-                if (IsFiniteMode() && (nextOrder < 0 || nextOrder >= _enabledIndices.Count))
+                if (!TryResolveNextCatalogNeighbor(edge, forward, out int nextOrder, out int nextLogical))
                 {
                     return;
                 }
 
-                int nextLogical = ResolveLogicalIndexFromOrder(nextOrder);
-                if (nextLogical < 0)
+                VisualItem existingAtOrder = FindChainVisualByOrder(nextOrder);
+                if (existingAtOrder != null)
                 {
                     return;
                 }
 
-                // Infinite mode may need several chain nodes for the same logical
-                // (e.g. A,B,C,D,A,B,...) when enabled count < visible slots.
-                // Uniqueness is per absolute order, not per logical index.
-                if (FindChainVisualByOrder(nextOrder) != null)
+                if (IsFiniteMode() && FindChainVisualByLogicalIndex(nextLogical) != null)
+                {
+                    return;
+                }
+
+                if (!IsFiniteMode() && HasChainVisualForLogicalNearOrder(nextLogical, nextOrder))
+                {
+                    return;
+                }
+
+                if (_enabledIndices.Count > 1 &&
+                    IsLogicalAlreadyAdjacentOnChainEdge(edge, nextLogical, forward))
                 {
                     return;
                 }
@@ -2097,7 +2806,7 @@ namespace EasyScroller
 
         private void TrimChainCoverage(float halfExtent)
         {
-            if (_chainHead == null)
+            if (_chainHead == null || _deferChainTrim)
             {
                 return;
             }
@@ -2109,6 +2818,11 @@ namespace EasyScroller
             while (_chainHead != null && _chainHead != _chainTail && headOutside > bufferAllowance)
             {
                 VisualItem head = _chainHead;
+                if (head == _snapTargetChainVisual)
+                {
+                    break;
+                }
+
                 if (GetVisualAxis(head) >= strictMin)
                 {
                     break;
@@ -2123,6 +2837,11 @@ namespace EasyScroller
             while (_chainTail != null && _chainHead != _chainTail && tailOutside > bufferAllowance)
             {
                 VisualItem tail = _chainTail;
+                if (tail == _snapTargetChainVisual)
+                {
+                    break;
+                }
+
                 if (GetVisualAxis(tail) <= halfExtent)
                 {
                     break;
@@ -2435,6 +3154,312 @@ namespace EasyScroller
             _chainTail = null;
         }
 
+        /// <summary>
+        /// Clears the chain and any active scroller wrappers still parented under the
+        /// container (orphans from bad splices). ReleaseAllChainVisuals alone leaves
+        /// those visible and causes duplicate copies of the same list entry.
+        /// </summary>
+        private void PurgeAllScrollerVisualsFromContainer()
+        {
+            ReleaseAllChainVisuals();
+
+            if (_containerRect == null)
+            {
+                return;
+            }
+
+            for (int i = _containerRect.childCount - 1; i >= 0; i--)
+            {
+                RectTransform childRect = _containerRect.GetChild(i) as RectTransform;
+                if (childRect == null || !childRect.gameObject.activeSelf)
+                {
+                    continue;
+                }
+
+                ScrollerItemRuntimeInfo runtimeInfo = childRect.GetComponent<ScrollerItemRuntimeInfo>();
+                if (runtimeInfo == null || runtimeInfo.Manager != this)
+                {
+                    continue;
+                }
+
+                VisualItem tracked = TryFindVisualItemForRectTransform(childRect);
+                if (tracked != null)
+                {
+                    DetachFromChain(tracked);
+                    ReleaseVisual(tracked);
+                }
+                else
+                {
+                    Destroy(childRect.gameObject);
+                }
+            }
+        }
+
+        private static bool IsLogicalAlreadyAdjacentOnChainEdge(VisualItem edge, int logical, bool forward)
+        {
+            if (edge == null || logical < 0)
+            {
+                return false;
+            }
+
+            if (edge.LogicalIndex == logical)
+            {
+                return true;
+            }
+
+            VisualItem towardNeighbor = forward ? edge.Next : edge.Prev;
+            return towardNeighbor != null && towardNeighbor.LogicalIndex == logical;
+        }
+
+        private void SetVisualAxisToLatticeOrder(VisualItem visual, int absoluteOrder)
+        {
+            if (visual == null)
+            {
+                return;
+            }
+
+            float axis = GetOrderCenterPosition(absoluteOrder) - _scrollOffset;
+            SetVisualAxis(visual, axis);
+            visual.SnapToTargetOnPrepare = true;
+        }
+
+        /// <summary>
+        /// Builds the visible chain from lattice orders around the current scroll offset:
+        /// one node per absolute order, ascending slot sequence, no grow-from-seed drift.
+        /// </summary>
+        private void RebuildChainCoveringViewport()
+        {
+            int count = _enabledIndices.Count;
+            if (count == 0)
+            {
+                return;
+            }
+
+            float halfExtent = GetVisibleHalfExtent();
+            int centerOrder = ClampOrderForMode(GetNearestOrderToOffset(_scrollOffset));
+            CollectAbsoluteOrdersCoveringViewport(centerOrder, halfExtent, _viewportOrdersScratch);
+            if (_viewportOrdersScratch.Count == 0)
+            {
+                return;
+            }
+
+            VisualItem prev = null;
+            for (int i = 0; i < _viewportOrdersScratch.Count; i++)
+            {
+                int order = _viewportOrdersScratch[i];
+                int logical = ResolveLogicalIndexFromOrder(order);
+                if (logical < 0)
+                {
+                    continue;
+                }
+
+                VisualItem visual = AcquireAndAttachFreshVisual(order, logical);
+                if (visual == null)
+                {
+                    continue;
+                }
+
+                if (prev == null)
+                {
+                    InsertAsOnlyChainNode(visual);
+                }
+                else
+                {
+                    AppendToTail(visual);
+                }
+
+                SetVisualAxisToLatticeOrder(visual, order);
+                prev = visual;
+            }
+        }
+
+        private float GetBufferAxisExtent()
+        {
+            int count = _enabledIndices.Count;
+            if (count <= 0 || buffer_item_count <= 0)
+            {
+                return 0f;
+            }
+
+            float spanSum = 0f;
+            for (int i = 0; i < count; i++)
+            {
+                spanSum += Mathf.Max(1f, _items[_enabledIndices[i]].Height + item_gap);
+            }
+
+            float averageSpan = spanSum / count;
+            return buffer_item_count * averageSpan;
+        }
+
+        private void CollectAbsoluteOrdersCoveringViewport(int centerOrder, float halfExtent, List<int> ordersOut)
+        {
+            ordersOut.Clear();
+            int count = _enabledIndices.Count;
+            if (count <= 0)
+            {
+                return;
+            }
+
+            float bufferExtent = GetBufferAxisExtent();
+            float maxAxis = halfExtent + bufferExtent;
+            float minAxis = -halfExtent - bufferExtent;
+            int safety = count * 4 + (buffer_item_count * 4) + 16;
+
+            ordersOut.Add(centerOrder);
+
+            for (int step = 1; step < safety; step++)
+            {
+                int order = centerOrder + step;
+                if (IsFiniteMode() && order >= count)
+                {
+                    break;
+                }
+
+                float axis = GetOrderCenterPosition(order) - _scrollOffset;
+                if (axis > maxAxis)
+                {
+                    break;
+                }
+
+                ordersOut.Add(order);
+            }
+
+            int backwardCount = 0;
+            for (int step = 1; step < safety; step++)
+            {
+                int order = centerOrder - step;
+                if (IsFiniteMode() && order < 0)
+                {
+                    break;
+                }
+
+                float axis = GetOrderCenterPosition(order) - _scrollOffset;
+                if (axis < minAxis)
+                {
+                    break;
+                }
+
+                backwardCount++;
+            }
+
+            if (backwardCount > 0)
+            {
+                var backward = new List<int>(backwardCount);
+                for (int step = backwardCount; step >= 1; step--)
+                {
+                    backward.Add(centerOrder - step);
+                }
+
+                backward.AddRange(ordersOut);
+                ordersOut.Clear();
+                ordersOut.AddRange(backward);
+            }
+
+            ordersOut.Sort();
+        }
+
+        private void EnsureChainValidityWithFallback(string phase)
+        {
+            if (ValidateChainInvariants(out string reason))
+            {
+                return;
+            }
+
+            Debug.LogWarning($"ScrollerManager chain invariant failed during {phase}: {reason}");
+            TryFallbackFullRebuild(reason);
+        }
+
+        private bool ValidateChainInvariants(out string reason)
+        {
+            reason = string.Empty;
+            if (_chainHead == null)
+            {
+                return true;
+            }
+
+            if (_chainHead.Prev != null)
+            {
+                reason = "head prev link not null";
+                return false;
+            }
+
+            HashSet<int> seenOrders = new HashSet<int>();
+            int count = _enabledIndices.Count;
+            int? previousOrder = null;
+            VisualItem current = _chainHead;
+            while (current != null)
+            {
+                if (GetEnabledSlot(current.LogicalIndex) < 0)
+                {
+                    reason = $"disabled logical in chain: {current.LogicalIndex}";
+                    return false;
+                }
+
+                if (!seenOrders.Add(current.AbsoluteOrderIndex))
+                {
+                    reason = $"duplicate absolute order in chain: {current.AbsoluteOrderIndex}";
+                    return false;
+                }
+
+                if (ResolveLogicalIndexFromOrder(current.AbsoluteOrderIndex) != current.LogicalIndex)
+                {
+                    reason = $"order/logical mismatch at order {current.AbsoluteOrderIndex}";
+                    return false;
+                }
+
+                if (previousOrder.HasValue && current.AbsoluteOrderIndex <= previousOrder.Value)
+                {
+                    reason = "non-increasing absolute orders";
+                    return false;
+                }
+
+                if (current.Next != null)
+                {
+                    int slotCurrent = GetEnabledSlot(current.LogicalIndex);
+                    int slotNext = GetEnabledSlot(current.Next.LogicalIndex);
+                    if (slotCurrent < 0 || slotNext < 0 || !IsLogicallySequentialForward(slotCurrent, slotNext, count))
+                    {
+                        reason = "non-sequential enabled slots";
+                        return false;
+                    }
+
+                    if (count > 1 && current.LogicalIndex == current.Next.LogicalIndex)
+                    {
+                        reason = "adjacent duplicate logicals";
+                        return false;
+                    }
+                }
+
+                previousOrder = current.AbsoluteOrderIndex;
+                if (current.Next == null && _chainTail != current)
+                {
+                    reason = "tail pointer mismatch";
+                    return false;
+                }
+
+                current = current.Next;
+            }
+
+            return true;
+        }
+
+        private void TryFallbackFullRebuild(string reason)
+        {
+            PurgeAllScrollerVisualsFromContainer();
+            RebuildChainCoveringViewport();
+
+            if (_chainHead == null)
+            {
+                BuildInitialAnchorAtOrder(GetFallbackCenterOrder());
+                EnsureViewportCoverageFromCatalog(GetVisibleHalfExtent());
+            }
+
+            if (!ValidateChainInvariants(out string postReason))
+            {
+                Debug.LogWarning($"ScrollerManager fallback rebuild remained invalid ({reason} -> {postReason}).");
+            }
+        }
+
         // -----------------------------------------------------------------
         // Pool helpers + visual acquisition
         // -----------------------------------------------------------------
@@ -2452,6 +3477,7 @@ namespace EasyScroller
             visual.SnapToTargetOnPrepare = true;
             visual.HiddenFramesRemaining = _pendingInitialReveal ? 0 : 1;
             ApplyRuntimeInfoBinding(visual, logicalIndex);
+            SyncVisualContentToCatalog(visual);
 
             if (visual.RectTransform != null)
             {
@@ -2488,7 +3514,98 @@ namespace EasyScroller
                 }
             }
 
+            VisualItem inactive = TryClaimInactiveScrollerVisual(logicalIndex, poolKey);
+            if (inactive != null)
+            {
+                return inactive;
+            }
+
             return CreateNewVisualWrapper(logicalIndex);
+        }
+
+        /// <summary>
+        /// Reclaims inactive scroller wrappers that fell off the pool stack (e.g. after bad splices)
+        /// before allocating another prefab instance.
+        /// </summary>
+        private VisualItem TryClaimInactiveScrollerVisual(int logicalIndex, int poolKey)
+        {
+            if (_containerRect == null || logicalIndex < 0 || logicalIndex >= _items.Count)
+            {
+                return null;
+            }
+
+            GameObject expectedPrefab = _items[logicalIndex].Prefab;
+            for (int i = 0; i < _containerRect.childCount; i++)
+            {
+                RectTransform childRect = _containerRect.GetChild(i) as RectTransform;
+                if (childRect == null || childRect.gameObject.activeSelf)
+                {
+                    continue;
+                }
+
+                ScrollerItemRuntimeInfo runtimeInfo = childRect.GetComponent<ScrollerItemRuntimeInfo>();
+                if (runtimeInfo == null || runtimeInfo.Manager != this)
+                {
+                    continue;
+                }
+
+                if (TryFindVisualItemForRectTransform(childRect) != null)
+                {
+                    continue;
+                }
+
+                if (!InactiveScrollerVisualMatchesPoolKey(runtimeInfo, logicalIndex, poolKey, expectedPrefab))
+                {
+                    continue;
+                }
+
+                return new VisualItem
+                {
+                    LogicalIndex = logicalIndex,
+                    BoundContentPrefab = expectedPrefab,
+                    RectTransform = childRect,
+                    CanvasGroup = childRect.GetComponent<CanvasGroup>(),
+                    RuntimeInfo = runtimeInfo,
+                    BaseLocalScale = childRect.localScale,
+                    SnapToTargetOnPrepare = true,
+                    HalfSizeAxis = 0.5f * _items[logicalIndex].Height,
+                    HasMeasuredHalfSize = false,
+                };
+            }
+
+            return null;
+        }
+
+        private bool InactiveScrollerVisualMatchesPoolKey(
+            ScrollerItemRuntimeInfo runtimeInfo,
+            int logicalIndex,
+            int poolKey,
+            GameObject expectedPrefab)
+        {
+            if (runtimeInfo == null)
+            {
+                return false;
+            }
+
+            if (IsSharedVisualRecycleMode())
+            {
+                return true;
+            }
+
+            if (runtimeInfo.LogicalIndex >= 0 &&
+                runtimeInfo.LogicalIndex < _items.Count &&
+                GetVisualPoolKey(runtimeInfo.LogicalIndex) == poolKey)
+            {
+                return true;
+            }
+
+            if (expectedPrefab == null || runtimeInfo.ContentRect == null)
+            {
+                return false;
+            }
+
+            string expectedContentName = expectedPrefab.name + "_ScrollerItem";
+            return runtimeInfo.ContentRect.name == expectedContentName;
         }
 
         private VisualItem CreateNewVisualWrapper(int logicalIndex)
@@ -2523,9 +3640,11 @@ namespace EasyScroller
             canvasGroup.interactable = true;
             canvasGroup.blocksRaycasts = true;
 
+            GameObject sourcePrefab = _items[logicalIndex].Prefab;
             return new VisualItem
             {
                 LogicalIndex = logicalIndex,
+                BoundContentPrefab = sourcePrefab,
                 RectTransform = wrapperRect,
                 CanvasGroup = canvasGroup,
                 RuntimeInfo = runtimeInfo,
@@ -2541,6 +3660,11 @@ namespace EasyScroller
             if (visual == null || visual.RectTransform == null)
             {
                 return;
+            }
+
+            if (visual.IsInChain)
+            {
+                DetachFromChain(visual);
             }
 
             if (visual.RuntimeInfo != null)
@@ -2597,6 +3721,106 @@ namespace EasyScroller
             }
 
             return bindingChanged;
+        }
+
+        /// <summary>
+        /// Re-instantiates pooled content when the logical now maps to a different prefab.
+        /// </summary>
+        private void SyncVisualContentToCatalog(VisualItem visual)
+        {
+            if (visual?.RuntimeInfo == null || visual.LogicalIndex < 0 || visual.LogicalIndex >= _items.Count)
+            {
+                return;
+            }
+
+            GameObject expectedPrefab = _items[visual.LogicalIndex].Prefab;
+            if (expectedPrefab == null)
+            {
+                return;
+            }
+
+            if (visual.BoundContentPrefab == expectedPrefab)
+            {
+                return;
+            }
+
+            RectTransform wrapperRect = visual.RuntimeInfo.WrapperRect;
+            if (wrapperRect == null)
+            {
+                return;
+            }
+
+            RectTransform oldContent = visual.RuntimeInfo.ContentRect;
+            if (oldContent != null)
+            {
+                Destroy(oldContent.gameObject);
+            }
+
+            GameObject content = Instantiate(expectedPrefab, wrapperRect);
+            content.name = expectedPrefab.name + "_ScrollerItem";
+            RectTransform contentRect = content.GetComponent<RectTransform>();
+            if (contentRect == null)
+            {
+                contentRect = content.AddComponent<RectTransform>();
+            }
+
+            visual.RuntimeInfo.Initialize(
+                visual.LogicalIndex,
+                _items[visual.LogicalIndex].DataIndex,
+                wrapperRect,
+                contentRect);
+            visual.RuntimeInfo.SetManager(this);
+            visual.BoundContentPrefab = expectedPrefab;
+            visual.HalfSizeAxis = 0.5f * _items[visual.LogicalIndex].Height;
+            visual.HasMeasuredHalfSize = false;
+            RequestVisualContentRefresh(visual.RuntimeInfo, scheduleDeferredOnly: false);
+        }
+
+        /// <summary>
+        /// Finite lists: every enabled catalog entry must have exactly one chain visual after insert.
+        /// </summary>
+        private void EnsureMissingEnabledLogicalsOnChain()
+        {
+            if (!IsFiniteMode() || _enabledIndices.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < _enabledIndices.Count; i++)
+            {
+                int logical = _enabledIndices[i];
+                if (FindChainVisualByLogicalIndex(logical) != null)
+                {
+                    continue;
+                }
+
+                int slot = GetEnabledSlot(logical);
+                if (slot < 0)
+                {
+                    continue;
+                }
+
+                int order = slot;
+                VisualItem visual = AcquireAndAttachFreshVisual(order, logical);
+                if (visual == null)
+                {
+                    continue;
+                }
+
+                if (_chainHead == null)
+                {
+                    InsertAsOnlyChainNode(visual);
+                    SetVisualAxisToLatticeOrder(visual, order);
+                    continue;
+                }
+
+                if (!TryAttachSplicedVisualByEnabledSlot(visual, slot, order))
+                {
+                    ReleaseVisual(visual);
+                }
+            }
+
+            PruneToSingleVisualPerLogicalOnChain();
         }
 
         private void RequestVisualContentRefresh(ScrollerItemRuntimeInfo runtimeInfo, bool scheduleDeferredOnly = false)
@@ -2788,16 +4012,17 @@ namespace EasyScroller
                 }
             }
 
+            ConsumePendingMutation(
+                out MutationKind mutationKind,
+                out int mutationLogicalIndex,
+                out int mutationFromLogicalIndex,
+                out int mutationToLogicalIndex);
+
             // Re-anchor _scrollOffset so the stability visual's logical lands on
             // its original screen axis after the new spacing is applied. If the
             // original stability visual was disabled itself, pick a replacement
-            // that's closest to where the old anchor sat. Order reassignment
-            // for the rest of the chain happens later via ReconcileChain.
-            int pendingSplice = _pendingSpliceLogicalIndex;
-            _pendingSpliceLogicalIndex = -1;
-            bool skipReanchorForAdd = pendingSplice >= 0;
-
-            if (wantsRelayout && _chainHead != null && !skipReanchorForAdd)
+            // that's closest to where the old anchor sat.
+            if (wantsRelayout && _chainHead != null)
             {
                 VisualItem reAnchor = null;
                 float reAnchorAxis = stabilityAxis;
@@ -2824,6 +4049,11 @@ namespace EasyScroller
                     int newOrder = ComputeNearestOrderForLogical(reAnchor.LogicalIndex, _scrollOffset);
                     float newLattice = GetOrderCenterPosition(newOrder);
                     _scrollOffset = newLattice - reAnchorAxis;
+
+                    if (TryComputeMutationPreferredOffset(mutationKind, mutationLogicalIndex, out float preferredOffset))
+                    {
+                        _scrollOffset = preferredOffset;
+                    }
                 }
                 else
                 {
@@ -2838,15 +4068,102 @@ namespace EasyScroller
             _skipCollectiveScrollThisFrame = true;
             _lastScrollOffsetForChainMotion = _scrollOffset;
 
+            ApplyPendingMutationToChain(mutationKind, mutationLogicalIndex, mutationFromLogicalIndex, mutationToLogicalIndex);
             NormalizeMotionStateAfterStructureChange();
-
-            if (pendingSplice >= 0)
-            {
-                TrySpliceAddedVisualIntoChain(pendingSplice);
-            }
+            _validateChainThisFrame = true;
 
             SyncVisibleWindow();
             RefreshLinkedScrollbarState();
+        }
+
+        private void ApplyPendingMutationToChain(MutationKind mutationKind, int mutationLogicalIndex, int mutationFromLogicalIndex, int mutationToLogicalIndex)
+        {
+            if (_enabledIndices.Count == 0)
+            {
+                return;
+            }
+
+            switch (mutationKind)
+            {
+                case MutationKind.Insert:
+                    if (!TrySpliceAddedVisualIntoChain(mutationLogicalIndex))
+                    {
+                        EnsureLogicalVisualOnChain(mutationLogicalIndex);
+                    }
+
+                    if (IsFiniteMode())
+                    {
+                        PruneToSingleVisualPerLogicalOnChain();
+                        EnsureMissingEnabledLogicalsOnChain();
+                    }
+                    else
+                    {
+                        PruneAdjacentDuplicateLogicalsOnChain();
+                        PrunePrematureDuplicateLogicalInstancesOnChain();
+                    }
+
+                    ReleaseOrphanedChainIslands();
+                    if (!IsFiniteMode() && _chainHead != null)
+                    {
+                        SyncOrdersAlongChainLinks();
+                    }
+                    break;
+
+                case MutationKind.Remove:
+                    if (mutationLogicalIndex >= 0)
+                    {
+                        PurgeVisualsForLogicalIndex(mutationLogicalIndex);
+                    }
+                    break;
+
+                case MutationKind.Reorder:
+                    // Reorder can invalidate many neighbor links at once. Keep existing visuals
+                    // and let ReconcileChainLogicalsAndOrders trim and regrow deterministically.
+                    if (mutationFromLogicalIndex >= 0 || mutationToLogicalIndex >= 0)
+                    {
+                        // Intentional no-op; values are consumed for diagnostics.
+                    }
+                    break;
+
+                case MutationKind.Rebuild:
+                    PurgeAllScrollerVisualsFromContainer();
+                    RebuildChainCoveringViewport();
+                    break;
+            }
+        }
+
+        private bool TryComputeMutationPreferredOffset(MutationKind mutationKind, int mutationLogicalIndex, out float preferredOffset)
+        {
+            preferredOffset = 0f;
+            if (mutationKind != MutationKind.Insert || mutationLogicalIndex < 0)
+            {
+                return false;
+            }
+
+            int slot = GetEnabledSlot(mutationLogicalIndex);
+            if (slot != 0 || _enabledIndices.Count == 0)
+            {
+                return false;
+            }
+
+            if (_enabledIndices.Count == 1)
+            {
+                int order = IsFiniteMode() ? 0 : ComputeNearestOrderForLogical(mutationLogicalIndex, 0f);
+                preferredOffset = GetOrderCenterPosition(order);
+                return true;
+            }
+
+            float frontSpan = _enabledPrefixPositions[1];
+            float nearStartThreshold = Mathf.Max(1f, 0.5f * (_items[mutationLogicalIndex].Height + item_gap));
+            if (Mathf.Abs(_scrollOffset) <= nearStartThreshold)
+            {
+                int newOrder = IsFiniteMode() ? 0 : ComputeNearestOrderForLogical(mutationLogicalIndex, 0f);
+                preferredOffset = GetOrderCenterPosition(newOrder);
+                return true;
+            }
+
+            preferredOffset = _scrollOffset + frontSpan;
+            return true;
         }
 
         private void PruneInvalidChainVisuals()
