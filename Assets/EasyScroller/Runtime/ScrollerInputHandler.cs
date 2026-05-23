@@ -56,16 +56,6 @@ namespace EasyScroller
             _spinRoutine = StartCoroutine(SpinRoutine(direction > 0 ? 1f : -1f, speedUnitsPerSecond, durationSeconds));
         }
 
-        public void StartSpinPositive(float speedUnitsPerSecond, float durationSeconds)
-        {
-            StartSpin(1, speedUnitsPerSecond, durationSeconds);
-        }
-
-        public void StartSpinNegative(float speedUnitsPerSecond, float durationSeconds)
-        {
-            StartSpin(-1, speedUnitsPerSecond, durationSeconds);
-        }
-
         public void StopSpin()
         {
             if (_spinRoutine != null)

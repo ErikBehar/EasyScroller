@@ -159,7 +159,6 @@ namespace EasyScroller
             None,
             Insert,
             Remove,
-            Reorder,
             Rebuild
         }
 
@@ -190,7 +189,6 @@ namespace EasyScroller
         private float _snapTargetOffset;
         private bool _snapTargetLockedUntilUserInput;
         private bool _hasSettledOrder;
-        private int _settledOrder;
         private VisualItem _snapTargetChainVisual;
         private VisualItem _settledChainVisual;
         private bool _relayoutActive;
@@ -207,8 +205,6 @@ namespace EasyScroller
         private bool _scrollbarPointerHeld;
         private MutationKind _pendingMutationKind = MutationKind.None;
         private int _pendingMutationLogicalIndex = -1;
-        private int _pendingMutationFromLogicalIndex = -1;
-        private int _pendingMutationToLogicalIndex = -1;
         private float _lastScrollOffsetForChainMotion;
         private bool _skipCollectiveScrollThisFrame;
         private readonly List<int> _viewportOrdersScratch = new List<int>();
@@ -241,7 +237,7 @@ namespace EasyScroller
             BuildItemState();
             if (_items.Count == 0)
             {
-                Debug.LogWarning("ScrollerManager has no prefabs configured. Call SetPrefabs(...) during debug mode.");
+                Debug.LogWarning("ScrollerManager has no prefabs configured. Assign prefabs in the inspector or call SetPrefabs(...) at runtime.");
             }
             RefreshEnabledIndices();
             _relayoutActive = false;
@@ -325,7 +321,6 @@ namespace EasyScroller
                 {
                     _snapVelocity = 0f;
                     _hasSettledOrder = _snapTargetChainVisual != null;
-                    _settledOrder = _snapTargetOrder;
                     _settledChainVisual = _snapTargetChainVisual;
                     _hasSnapTarget = false;
                 }
@@ -526,45 +521,27 @@ namespace EasyScroller
         {
             _pendingMutationKind = MutationKind.Insert;
             _pendingMutationLogicalIndex = logicalIndex;
-            _pendingMutationFromLogicalIndex = -1;
-            _pendingMutationToLogicalIndex = -1;
         }
 
         private void MarkPendingRemoveMutation(int logicalIndex)
         {
             _pendingMutationKind = MutationKind.Remove;
             _pendingMutationLogicalIndex = logicalIndex;
-            _pendingMutationFromLogicalIndex = logicalIndex;
-            _pendingMutationToLogicalIndex = -1;
-        }
-
-        private void MarkPendingReorderMutation(int fromLogicalIndex, int toLogicalIndex)
-        {
-            _pendingMutationKind = MutationKind.Reorder;
-            _pendingMutationLogicalIndex = -1;
-            _pendingMutationFromLogicalIndex = fromLogicalIndex;
-            _pendingMutationToLogicalIndex = toLogicalIndex;
         }
 
         private void MarkPendingRebuildMutation()
         {
             _pendingMutationKind = MutationKind.Rebuild;
             _pendingMutationLogicalIndex = -1;
-            _pendingMutationFromLogicalIndex = -1;
-            _pendingMutationToLogicalIndex = -1;
         }
 
-        private void ConsumePendingMutation(out MutationKind kind, out int logicalIndex, out int fromLogicalIndex, out int toLogicalIndex)
+        private void ConsumePendingMutation(out MutationKind kind, out int logicalIndex)
         {
             kind = _pendingMutationKind;
             logicalIndex = _pendingMutationLogicalIndex;
-            fromLogicalIndex = _pendingMutationFromLogicalIndex;
-            toLogicalIndex = _pendingMutationToLogicalIndex;
 
             _pendingMutationKind = MutationKind.None;
             _pendingMutationLogicalIndex = -1;
-            _pendingMutationFromLogicalIndex = -1;
-            _pendingMutationToLogicalIndex = -1;
         }
 
         private void RebuildEnabledSpacingData()
@@ -741,11 +718,6 @@ namespace EasyScroller
             return _enabledIndices[wrapped];
         }
 
-        private int GetTargetOrderForLogicalIndex(int logicalIndex)
-        {
-            return ComputeNearestOrderForLogical(logicalIndex, _scrollOffset);
-        }
-
         /// <summary>
         /// Picks the absolute order for <paramref name="logicalIndex"/> whose lattice center
         /// is closest to <paramref name="referenceOffset"/> (searches all wrap cycles).
@@ -785,38 +757,6 @@ namespace EasyScroller
             while (improved);
 
             return bestOrder;
-        }
-
-        private int GetReferenceOrderForProgrammaticNavigation()
-        {
-            bool userDrivenMotion = _isDragging || Mathf.Abs(_scrollVelocity) > 0.001f;
-            if (userDrivenMotion)
-            {
-                _hasProgrammaticStepAnchor = false;
-                return GetNearestOrderToOffset(_scrollOffset);
-            }
-
-            if (_hasProgrammaticStepAnchor)
-            {
-                return _programmaticStepOrder;
-            }
-
-            if (_hasSnapTarget)
-            {
-                return _snapTargetOrder;
-            }
-
-            if (_hasSettledOrder)
-            {
-                if (IsVisualActiveInChain(_settledChainVisual))
-                {
-                    return _settledChainVisual.AbsoluteOrderIndex;
-                }
-
-                return _settledOrder;
-            }
-
-            return GetNearestOrderToOffset(_scrollOffset);
         }
 
         private VisualItem GetReferenceChainVisualForNavigation()
@@ -947,7 +887,6 @@ namespace EasyScroller
             _scrollOffset = ClampOffsetForMode(ComputeScrollOffsetToCenterVisual(targetVisual));
             ClearActiveSnapState();
             _hasSettledOrder = true;
-            _settledOrder = targetVisual.AbsoluteOrderIndex;
             _settledChainVisual = targetVisual;
             ApplyScrollOffsetToChainImmediately();
         }
@@ -1147,7 +1086,6 @@ namespace EasyScroller
                     _lastScrollOffsetForChainMotion = _scrollOffset;
                     ClearActiveSnapState();
                     _hasSettledOrder = true;
-                    _settledOrder = _programmaticStepOrder;
                     _settledChainVisual = null;
                     ApplyScrollOffsetToChainImmediately();
                 }
@@ -1288,12 +1226,6 @@ namespace EasyScroller
 
             TrimChainCoverage(halfExtent);
 
-            if (_enabledIndices.Count > 1)
-            {
-                PruneAdjacentDuplicateLogicalsOnChain();
-                PruneDuplicateLogicalInstancesOnChain();
-            }
-
             if (!IsFiniteMode() && _chainHead != null)
             {
                 SyncOrdersAlongChainLinks();
@@ -1302,7 +1234,7 @@ namespace EasyScroller
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
             if (_validateChainThisFrame)
             {
-                EnsureChainValidityWithFallback("mutation");
+                LogChainInvariantFailureIfNeeded("mutation");
                 _validateChainThisFrame = false;
             }
 #endif
@@ -1619,18 +1551,6 @@ namespace EasyScroller
                     _hasSettledOrder = false;
                     _settledChainVisual = null;
                 }
-                else if (IsFiniteMode())
-                {
-                    int slot = GetEnabledSlot(_settledChainVisual.LogicalIndex);
-                    if (slot >= 0)
-                    {
-                        _settledOrder = slot;
-                    }
-                }
-                else
-                {
-                    _settledOrder = _settledChainVisual.AbsoluteOrderIndex;
-                }
             }
 
             if (_hasProgrammaticStepAnchor && IsFiniteMode())
@@ -1699,7 +1619,6 @@ namespace EasyScroller
                     _hasSnapTarget = false;
                     _snapVelocity = 0f;
                     _hasSettledOrder = true;
-                    _settledOrder = targetVisual.AbsoluteOrderIndex;
                     _settledChainVisual = targetVisual;
                     _snapTargetChainVisual = targetVisual;
                     return;
@@ -3358,7 +3277,7 @@ namespace EasyScroller
             ordersOut.Sort();
         }
 
-        private void EnsureChainValidityWithFallback(string phase)
+        private void LogChainInvariantFailureIfNeeded(string phase)
         {
             if (ValidateChainInvariants(out string reason))
             {
@@ -3366,7 +3285,6 @@ namespace EasyScroller
             }
 
             Debug.LogWarning($"ScrollerManager chain invariant failed during {phase}: {reason}");
-            TryFallbackFullRebuild(reason);
         }
 
         private bool ValidateChainInvariants(out string reason)
@@ -3441,23 +3359,6 @@ namespace EasyScroller
             }
 
             return true;
-        }
-
-        private void TryFallbackFullRebuild(string reason)
-        {
-            PurgeAllScrollerVisualsFromContainer();
-            RebuildChainCoveringViewport();
-
-            if (_chainHead == null)
-            {
-                BuildInitialAnchorAtOrder(GetFallbackCenterOrder());
-                EnsureViewportCoverageFromCatalog(GetVisibleHalfExtent());
-            }
-
-            if (!ValidateChainInvariants(out string postReason))
-            {
-                Debug.LogWarning($"ScrollerManager fallback rebuild remained invalid ({reason} -> {postReason}).");
-            }
         }
 
         // -----------------------------------------------------------------
@@ -4012,11 +3913,7 @@ namespace EasyScroller
                 }
             }
 
-            ConsumePendingMutation(
-                out MutationKind mutationKind,
-                out int mutationLogicalIndex,
-                out int mutationFromLogicalIndex,
-                out int mutationToLogicalIndex);
+            ConsumePendingMutation(out MutationKind mutationKind, out int mutationLogicalIndex);
 
             // Re-anchor _scrollOffset so the stability visual's logical lands on
             // its original screen axis after the new spacing is applied. If the
@@ -4068,7 +3965,7 @@ namespace EasyScroller
             _skipCollectiveScrollThisFrame = true;
             _lastScrollOffsetForChainMotion = _scrollOffset;
 
-            ApplyPendingMutationToChain(mutationKind, mutationLogicalIndex, mutationFromLogicalIndex, mutationToLogicalIndex);
+            ApplyPendingMutationToChain(mutationKind, mutationLogicalIndex);
             NormalizeMotionStateAfterStructureChange();
             _validateChainThisFrame = true;
 
@@ -4076,7 +3973,7 @@ namespace EasyScroller
             RefreshLinkedScrollbarState();
         }
 
-        private void ApplyPendingMutationToChain(MutationKind mutationKind, int mutationLogicalIndex, int mutationFromLogicalIndex, int mutationToLogicalIndex)
+        private void ApplyPendingMutationToChain(MutationKind mutationKind, int mutationLogicalIndex)
         {
             if (_enabledIndices.Count == 0)
             {
@@ -4096,11 +3993,6 @@ namespace EasyScroller
                         PruneToSingleVisualPerLogicalOnChain();
                         EnsureMissingEnabledLogicalsOnChain();
                     }
-                    else
-                    {
-                        PruneAdjacentDuplicateLogicalsOnChain();
-                        PrunePrematureDuplicateLogicalInstancesOnChain();
-                    }
 
                     ReleaseOrphanedChainIslands();
                     if (!IsFiniteMode() && _chainHead != null)
@@ -4113,15 +4005,6 @@ namespace EasyScroller
                     if (mutationLogicalIndex >= 0)
                     {
                         PurgeVisualsForLogicalIndex(mutationLogicalIndex);
-                    }
-                    break;
-
-                case MutationKind.Reorder:
-                    // Reorder can invalidate many neighbor links at once. Keep existing visuals
-                    // and let ReconcileChainLogicalsAndOrders trim and regrow deterministically.
-                    if (mutationFromLogicalIndex >= 0 || mutationToLogicalIndex >= 0)
-                    {
-                        // Intentional no-op; values are consumed for diagnostics.
                     }
                     break;
 

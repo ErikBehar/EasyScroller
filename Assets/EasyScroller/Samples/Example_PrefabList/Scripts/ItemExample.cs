@@ -1,73 +1,76 @@
-using UnityEngine;
 using EasyScroller;
+using UnityEngine;
 
-public class ItemExample : MonoBehaviour
+namespace EasyScroller.Samples
 {
-    private ScrollerItemRuntimeInfo info;
-
-    public UnityEngine.Events.UnityEvent onCenterEnter;
-    public UnityEngine.Events.UnityEvent onCenterExit;
-
-    private void Start()
+    public class ItemExample : MonoBehaviour
     {
-        if (!TryBindInfo())
+        private ScrollerItemRuntimeInfo info;
+
+        public UnityEngine.Events.UnityEvent onCenterEnter;
+        public UnityEngine.Events.UnityEvent onCenterExit;
+
+        private void Start()
         {
-            return;
+            if (!TryBindInfo())
+            {
+                return;
+            }
+
+            info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
+            OnCenterStateChanged(info.IsCentered);
         }
 
-        info.OnCenteredStateChanged.AddListener(OnCenterStateChanged);
-        OnCenterStateChanged(info.IsCentered);
-    }
-
-    public void OnCenterStateChanged(bool centered)
-    {
-        if (centered)
+        private void OnCenterStateChanged(bool centered)
         {
-            onCenterEnter.Invoke();
-        }
-        else
-        {
-            onCenterExit.Invoke();
-        }
-    }
-
-    public void DeleteSelf()
-    {
-        if (!TryBindInfo())
-        {
-            return;
+            if (centered)
+            {
+                onCenterEnter.Invoke();
+            }
+            else
+            {
+                onCenterExit.Invoke();
+            }
         }
 
-        info.RequestRemoveSelf();
-    }
-
-    private void OnDestroy()
-    {
-        if (info != null)
+        public void DeleteSelf()
         {
-            info.OnCenteredStateChanged.RemoveListener(OnCenterStateChanged);
-        }
-    }
+            if (!TryBindInfo())
+            {
+                return;
+            }
 
-    private bool TryBindInfo()
-    {
-        if (info != null)
-        {
-            return true;
+            info.RequestRemoveSelf();
         }
 
-        Transform current = transform.parent;
-        while (current != null)
+        private void OnDestroy()
         {
-            info = current.GetComponent<ScrollerItemRuntimeInfo>();
+            if (info != null)
+            {
+                info.OnCenteredStateChanged.RemoveListener(OnCenterStateChanged);
+            }
+        }
+
+        private bool TryBindInfo()
+        {
             if (info != null)
             {
                 return true;
             }
 
-            current = current.parent;
-        }
+            Transform current = transform.parent;
+            while (current != null)
+            {
+                info = current.GetComponent<ScrollerItemRuntimeInfo>();
+                if (info != null)
+                {
+                    return true;
+                }
 
-        return false;
+                current = current.parent;
+            }
+
+            return false;
+        }
     }
 }

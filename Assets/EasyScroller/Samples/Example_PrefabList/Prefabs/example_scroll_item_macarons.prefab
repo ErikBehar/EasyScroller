@@ -366,7 +366,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 08ef4de0f9c066c47b42f9ef43fdbd5f, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::ItemExample
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.ItemExample
   onCenterEnter:
     m_PersistentCalls:
       m_Calls:
@@ -768,7 +768,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 4683479740032173196}
-        m_TargetAssemblyTypeName: ItemExample, Assembly-CSharp
+        m_TargetAssemblyTypeName: EasyScroller.Samples.ItemExample, EasyScroller_Samples
         m_MethodName: DeleteSelf
         m_Mode: 1
         m_Arguments:

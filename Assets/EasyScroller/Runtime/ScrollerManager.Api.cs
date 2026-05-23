@@ -203,24 +203,6 @@ namespace EasyScroller
         }
 
         /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="ScrollToNearestVisibleSlot(int, bool)"/> (animated).
-        /// </summary>
-        /// <param name="dataIndex">Stable data index to locate.</param>
-        public void ScrollToNearestVisibleSlotNoRet(int dataIndex)
-        {
-            ScrollToNearestVisibleSlot(dataIndex);
-        }
-
-        /// <summary>
-        /// UnityEvent-friendly wrapper for <see cref="ScrollToNearestVisibleSlot(int, bool)"/> (instant).
-        /// </summary>
-        /// <param name="dataIndex">Stable data index to locate.</param>
-        public void JumpToNearestVisibleSlotNoRet(int dataIndex)
-        {
-            ScrollToNearestVisibleSlot(dataIndex, false);
-        }
-
-        /// <summary>
         /// UnityEvent-friendly wrapper for <see cref="ScrollToRuntimeInfo(ScrollerItemRuntimeInfo, bool)"/> (animated).
         /// </summary>
         /// <param name="runtimeInfo">Runtime item info to resolve target index from.</param>
@@ -495,7 +477,6 @@ namespace EasyScroller
                 ReindexSourcePrefabIndices();
             }
 
-            MarkPendingReorderMutation(fromIndex, toIndex);
             DestroyAllVisualsAndClearPools();
             ApplyStructureChangeAndRefreshVisuals();
             return true;
@@ -514,13 +495,12 @@ namespace EasyScroller
                 return false;
             }
 
-            int targetOrder = GetTargetOrderForLogicalIndex(logicalIndex);
-            float targetOffset = ClampOffsetForMode(GetOrderCenterPosition(targetOrder));
-            return ScrollToOffsetAndOrder(targetOffset, targetOrder, logicalIndex, animated);
+            return ScrollToOffsetAndOrder(0f, 0, logicalIndex, animated);
         }
 
         /// <summary>
         /// Scrolls or jumps to the first enabled item matching a stable data index.
+        /// In infinite mode this selects the nearest wrap copy on the lattice relative to the current scroll position.
         /// </summary>
         /// <param name="dataIndex">Data index to locate.</param>
         /// <param name="animated">True to animate via snap; false to jump instantly.</param>
@@ -557,20 +537,6 @@ namespace EasyScroller
             }
 
             return ScrollToLogicalIndex(_enabledIndices[visibleSlot], animated);
-        }
-
-        /// <summary>
-        /// Scrolls to the enabled item with the given stable data index.
-        /// In infinite mode this selects the nearest wrap copy on the lattice
-        /// (same implementation as <see cref="ScrollToDataIndex(int, bool)"/>).
-        /// In finite mode there is only one copy.
-        /// </summary>
-        /// <param name="dataIndex">Stable data index assigned at item creation.</param>
-        /// <param name="animated">True to animate via snap; false to jump instantly.</param>
-        /// <returns>True if a matching enabled item exists; otherwise false.</returns>
-        public bool ScrollToNearestVisibleSlot(int dataIndex, bool animated = true)
-        {
-            return ScrollToDataIndex(dataIndex, animated);
         }
 
         /// <summary>

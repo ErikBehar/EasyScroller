@@ -1,8 +1,11 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-[CreateAssetMenu(fileName = "ExampleDataHolder", menuName = "Scriptable Objects/ExampleDataHolder")]
-public class ExampleDataHolder : ScriptableObject
+namespace EasyScroller.Samples
 {
-    public List<Sprite> sprite_list;
+    [CreateAssetMenu(fileName = "ExampleDataHolder", menuName = "EasyScroller/Samples/Example Data Holder")]
+    public class ExampleDataHolder : ScriptableObject
+    {
+        public List<Sprite> sprite_list;
+    }
 }

@@ -170,7 +170,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 3aceb0c6f117e124789fb68a33ae4421, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: EasyScroller_Samples::AddItemIndex
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.AddItemIndex
   input_field: {fileID: 977391018}
   scroll_manager: {fileID: 119930688}
   prefab: {fileID: 0}
@@ -219,7 +219,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 952010}
-        m_TargetAssemblyTypeName: AddItemIndex, EasyScroller_Samples
+        m_TargetAssemblyTypeName: EasyScroller.Samples.AddItemIndex, EasyScroller_Samples
         m_MethodName: AddItemToScroller
         m_Mode: 1
         m_Arguments:
@@ -396,7 +396,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7756a3a2e1ee861439eacc904365ff1d, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::ScrollerManager
+  m_EditorClassIdentifier: EasyScrollerAssembly::EasyScroller.ScrollerManager
   item_source_mode: 1
   prefab_list: []
   single_prefab: {fileID: 3202979722558691739, guid: 217266f84efe99a409271c835d8b9a56, type: 3}
@@ -455,7 +455,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 948e01778ec9b3549949db84fdbcf6e7, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::ScrollerInputHandler
+  m_EditorClassIdentifier: EasyScrollerAssembly::EasyScroller.ScrollerInputHandler
   scroller_manager: {fileID: 119930688}
   drag_area_override: {fileID: 486156547}
   enable_item_drag: 1
@@ -863,7 +863,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 0c1e02622d0608044be041fbda3143b5, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::SpinExample
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.SpinExample
   direction: -1
   duration: 3
   speed: 3000
@@ -913,7 +913,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 377906765}
-        m_TargetAssemblyTypeName: SpinExample, Assembly-CSharp
+        m_TargetAssemblyTypeName: EasyScroller.Samples.SpinExample, EasyScroller_Samples
         m_MethodName: StartSpin
         m_Mode: 1
         m_Arguments:
@@ -1684,7 +1684,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 119930688}
-        m_TargetAssemblyTypeName: ScrollerManager, Assembly-CSharp
+        m_TargetAssemblyTypeName: EasyScroller.ScrollerManager, EasyScrollerAssembly
         m_MethodName: CenterPreviousItemNoRet
         m_Mode: 3
         m_Arguments:
@@ -1817,7 +1817,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 119930688}
-        m_TargetAssemblyTypeName: ScrollerManager, Assembly-CSharp
+        m_TargetAssemblyTypeName: EasyScroller.ScrollerManager, EasyScrollerAssembly
         m_MethodName: CenterNextItemNoRet
         m_Mode: 3
         m_Arguments:
@@ -2369,7 +2369,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: d332d2a91be4e20489ae106273ab0179, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: EasyScroller_Samples::ScrollToIndex
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.ScrollToIndex
   input_field: {fileID: 977391018}
   scroll_manager: {fileID: 119930688}
 --- !u!114 &1239215864
@@ -2417,7 +2417,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: 1239215863}
-        m_TargetAssemblyTypeName: ScrollToIndex, EasyScroller_Samples
+        m_TargetAssemblyTypeName: EasyScroller.Samples.ScrollToIndex, EasyScroller_Samples
         m_MethodName: DoScrollToIndex
         m_Mode: 1
         m_Arguments:

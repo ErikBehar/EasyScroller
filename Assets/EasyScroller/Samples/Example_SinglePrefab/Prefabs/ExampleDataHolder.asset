@@ -11,7 +11,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 2ae3bd3a95c56904caffc2567337a167, type: 3}
   m_Name: ExampleDataHolder
-  m_EditorClassIdentifier: Assembly-CSharp::ExampleDataHolder
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.ExampleDataHolder
   sprite_list:
   - {fileID: 21300000, guid: 990d4bcdb9a6f7842b06788d991a4be5, type: 3}
   - {fileID: 21300000, guid: dcee6b85c3a9bb1449c1e67c29fcd8c4, type: 3}

@@ -122,7 +122,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls:
       - m_Target: {fileID: -149162914041517782}
-        m_TargetAssemblyTypeName: ItemExampleLoader, Assembly-CSharp
+        m_TargetAssemblyTypeName: EasyScroller.Samples.ItemExampleLoader, EasyScroller_Samples
         m_MethodName: DeleteSelf
         m_Mode: 1
         m_Arguments:
@@ -223,7 +223,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: f0070d23ad9b4304bbbffd34d4ee72b7, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::ItemExample
+  m_EditorClassIdentifier: EasyScroller_Samples::EasyScroller.Samples.ItemExampleLoader
   image_holder: {fileID: 2837997009021155654}
   data: {fileID: 11400000, guid: e0f9e99ea81e8d843b37e1cde9301a69, type: 2}
   onCenterEnter:
