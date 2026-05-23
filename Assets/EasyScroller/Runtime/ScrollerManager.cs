@@ -208,6 +208,7 @@ namespace EasyScroller
         private float _lastScrollOffsetForChainMotion;
         private bool _skipCollectiveScrollThisFrame;
         private readonly List<int> _viewportOrdersScratch = new List<int>();
+        private readonly HashSet<RectTransform> _reachableChainRectsScratch = new HashSet<RectTransform>();
         private bool _validateChainThisFrame;
         private bool _deferChainTrim;
         private float _frameVisibleHalfExtent;
@@ -2901,19 +2902,19 @@ namespace EasyScroller
                 return;
             }
 
-            HashSet<RectTransform> reachable = new HashSet<RectTransform>();
+            _reachableChainRectsScratch.Clear();
             for (VisualItem chainVisual = _chainHead; chainVisual != null; chainVisual = chainVisual.Next)
             {
                 if (chainVisual.RectTransform != null)
                 {
-                    reachable.Add(chainVisual.RectTransform);
+                    _reachableChainRectsScratch.Add(chainVisual.RectTransform);
                 }
             }
 
             for (int i = 0; i < _containerRect.childCount; i++)
             {
                 RectTransform childRect = _containerRect.GetChild(i) as RectTransform;
-                if (childRect == null || !childRect.gameObject.activeSelf || reachable.Contains(childRect))
+                if (childRect == null || !childRect.gameObject.activeSelf || _reachableChainRectsScratch.Contains(childRect))
                 {
                     continue;
                 }
@@ -2924,7 +2925,7 @@ namespace EasyScroller
                     continue;
                 }
 
-                ReleaseOrphanIslandAtRectTransform(childRect, reachable);
+                ReleaseOrphanIslandAtRectTransform(childRect, _reachableChainRectsScratch);
             }
         }
 
