@@ -288,7 +288,7 @@ namespace EasyScroller
                     _scrollOffset = clampedOffset;
                     _scrollVelocity = 0f;
                 }
-                _scrollVelocity = Mathf.Lerp(_scrollVelocity, 0f, inertia_damping * dt);
+                _scrollVelocity = Mathf.Lerp(_scrollVelocity, 0f, GetExponentialMoveT(inertia_damping));
             }
 
             // Spring toward an active snap target (programmatic next/prev or auto-snap).
@@ -2799,7 +2799,7 @@ namespace EasyScroller
 
         private void UpdateVisualPresentation(float halfExtent)
         {
-            float dt = Time.deltaTime;
+            float scaleMoveT = GetExponentialMoveT(scale_lerp_speed);
 
             VisualItem v = _chainHead;
             while (v != null)
@@ -2820,7 +2820,7 @@ namespace EasyScroller
                         targetScale += highlight_scale_boost;
                     }
                     Vector3 desiredScale = v.BaseLocalScale * targetScale;
-                    v.RectTransform.localScale = Vector3.Lerp(v.RectTransform.localScale, desiredScale, scale_lerp_speed * dt);
+                    v.RectTransform.localScale = Vector3.Lerp(v.RectTransform.localScale, desiredScale, scaleMoveT);
 
                     if (v.CanvasGroup != null && !_pendingInitialReveal)
                     {
@@ -4127,10 +4127,15 @@ namespace EasyScroller
                    _scrollbarOffsetLeadsChain;
         }
 
+        private float GetExponentialMoveT(float strength)
+        {
+            return 1f - Mathf.Exp(-Mathf.Max(0.01f, strength) * Time.deltaTime);
+        }
+
         private float GetSpringMoveT(bool passiveRelayout)
         {
             float strength = passiveRelayout ? relayout_lerp_speed : chain_spring_strength;
-            return 1f - Mathf.Exp(-Mathf.Max(0.01f, strength) * Time.deltaTime);
+            return GetExponentialMoveT(strength);
         }
 
         private bool TryCaptureStabilityAnchorForStructureChange(
